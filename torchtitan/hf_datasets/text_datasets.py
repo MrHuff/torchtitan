@@ -478,48 +478,51 @@ class ChatDataset(IterableDataset, Stateful):
 class PackCollator:
     """Collate function that packs individual samples via pack().
 
-    Receives batch_size individual samples from the DataLoader, calls pack()
-    to bin-pack them into [batch_size, seq_len] with segment_ids, then
-    derives positions from segment_ids for the trainer.
+    Receives batch_size individual samples from the DataLoader, feeds them
+    to the shared pack() generator which greedy-packs into [1, seq_len]
+    sequences. Stacks all packed sequences into [batch_size, seq_len].
     """
 
     def __init__(self, seq_len: int, pad_id: int):
         self._seq_len = seq_len
-        self._pad_id = pad_id
-        self._pad_values = {"input_ids": pad_id, "label_ids": IGNORE_INDEX}
+        self._pad_values: dict[str, int | float] = {
+            "input_ids": pad_id,
+            "label_ids": IGNORE_INDEX,
+        }
 
     def __call__(
         self, samples: list[dict[str, list[int]]]
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        packed = pack(
-            token_seqs=[
-                {"input_ids": s["input_ids"], "label_ids": s["label_ids"]}
-                for s in samples
-            ],
-            sample_attrs=[{} for _ in samples],
-            max_seq_length=self._seq_len,
-            num_rows=len(samples),
-            pad_values=self._pad_values,
+        packed_list = list(
+            pack(
+                samples,
+                max_seq_length=self._seq_len,
+                pad_values=self._pad_values,
+            )
         )
 
-        # Derive positions from segment_ids (cumcount within each segment)
-        segment_ids = packed.segment_ids
+        # Stack [1, L] packed sequences into [num_packed, L]
+        input_ids = torch.cat([p["input_ids"] for p in packed_list])
+        label_ids = torch.cat([p["label_ids"] for p in packed_list])
+        segment_ids = torch.cat([p["segment_ids"] for p in packed_list])
+
+        # Derive positions from segment_ids
         B, L = segment_ids.shape
         positions = torch.zeros_like(segment_ids)
         for b in range(B):
             pos = 0
-            prev_seg = segment_ids[b, 0].item()
+            prev_segment = segment_ids[b, 0].item()
             for t in range(L):
-                cur_seg = segment_ids[b, t].item()
-                if cur_seg != prev_seg:
+                cur_segment = segment_ids[b, t].item()
+                if cur_segment != prev_segment:
                     pos = 0
-                    prev_seg = cur_seg
+                    prev_segment = cur_segment
                 positions[b, t] = pos
                 pos += 1
 
         return (
-            {"input": packed.token_seqs["input_ids"], "positions": positions},
-            packed.token_seqs["label_ids"],
+            {"input": input_ids, "positions": positions},
+            label_ids,
         )
 
 
@@ -573,6 +576,7 @@ class ChatDataLoader(ParallelAwareDataloader):
             infinite=config.infinite,
         )
 
+        assert tokenizer.eos_id is not None, "Tokenizer must have an eos_id"
         collate_fn = PackCollator(seq_len=seq_len, pad_id=tokenizer.eos_id)
 
         dataloader_kwargs = {

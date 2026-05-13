@@ -37,8 +37,6 @@ import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
-from torchtitan.components.loss import IGNORE_INDEX
-
 from torchtitan.config import (
     CompileConfig,
     ConfigManager,
@@ -54,7 +52,7 @@ from torchtitan.experiments.rl.types import (
     TrainBatch,
     Trajectory,
 )
-from torchtitan.hf_datasets.utils import _find_row
+from torchtitan.hf_datasets.utils import pack
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -167,99 +165,6 @@ def _log_samples(items: list[Episode] | list[Completion]) -> None:
         logger.info(f"       A: {item.text[:300].replace(chr(10), ' ').strip()}")
 
 
-class Batcher:
-    """Online batcher for RL. Packs episodes into TrainBatch objects via
-    first-fit row assignment. Flushes when the next sample doesn't fit.
-
-    add_sample() returns a list[TrainBatch] (one per row) when flushed, or None.
-    flush() returns remaining TrainBatches.
-    """
-
-    def __init__(
-        self,
-        microbatch_size: int,
-        max_seq_length: int,
-        pad_values: dict[str, int | float],
-    ):
-        self._microbatch_size = microbatch_size
-        self._max_seq_length = max_seq_length
-        self._pad_values = pad_values
-        self._reset()
-
-    def _reset(self):
-        self._buckets: list[list[dict]] = [[] for _ in range(self._microbatch_size)]
-        self._bucket_attrs: list[list[dict]] = [
-            [] for _ in range(self._microbatch_size)
-        ]
-        self._row_lengths = [0] * self._microbatch_size
-        self._rotate_idx = 0
-
-    def add_sample(self, token_seqs: dict, sample_attrs: dict) -> TrainBatch | None:
-        """Add a sample. Returns flushed TrainBatch if it doesn't fit, else None."""
-        first_key = next(iter(token_seqs))
-        length = len(token_seqs[first_key])
-        if length > self._max_seq_length:
-            return None
-
-        row_idx = _find_row(
-            length,
-            self._microbatch_size,
-            self._max_seq_length,
-            self._row_lengths,
-            [0] * self._microbatch_size,
-            self._rotate_idx,
-            False,
-        )
-
-        if row_idx < 0:
-            flushed = self.flush()
-            self._buckets[0].append(token_seqs)
-            self._bucket_attrs[0].append(sample_attrs)
-            self._row_lengths[0] = length
-            return flushed
-
-        self._buckets[row_idx].append(token_seqs)
-        self._bucket_attrs[row_idx].append(sample_attrs)
-        self._row_lengths[row_idx] += length
-        self._rotate_idx = row_idx
-        return None
-
-    def flush(self) -> TrainBatch | None:
-        """Flush all rows into a single flat varlen TrainBatch."""
-        if not any(self._buckets):
-            return None
-
-        all_ids: list[int] = []
-        prompt_lens: list[int] = []
-        response_lens: list[int] = []
-        advantages_list: list[float] = []
-        token_logprobs_list: list[list[float]] = []
-
-        for row_idx in range(self._microbatch_size):
-            for token_sequences, sample_attr in zip(
-                self._buckets[row_idx], self._bucket_attrs[row_idx]
-            ):
-                all_ids.extend(token_sequences["input_ids"])
-                prompt_lens.append(int(sample_attr["prompt_len"]))
-                response_lens.append(int(sample_attr["response_len"]))
-                advantages_list.append(sample_attr["advantage"])
-                token_logprobs_list.append(sample_attr["token_logprobs"])
-
-        self._reset()
-
-        if not all_ids:
-            return None
-
-        return TrainBatch(
-            token_ids=torch.tensor([all_ids], dtype=torch.long),
-            prompt_lens=prompt_lens,
-            response_lens=response_lens,
-            seq_lens=[p + r for p, r in zip(prompt_lens, response_lens)],
-            advantages=torch.tensor(advantages_list, dtype=torch.float32),
-            token_logprobs=token_logprobs_list,
-        )
-
-
 class RLTrainer(Configurable):
     """Top-level RL training orchestrator."""
 
@@ -338,7 +243,6 @@ class RLTrainer(Configurable):
         self.trainer = None
         self.generator = None
         self._proc_meshes = []
-        self._batcher: Batcher | None = None
 
     async def close(self):
         """Best-effort: tear down actors, then stop proc meshes."""
@@ -389,26 +293,51 @@ class RLTrainer(Configurable):
         )
 
     @staticmethod
-    def _episode_to_sample(ep: Episode) -> tuple[dict, dict]:
-        """Convert an Episode to (token_seqs, sample_attrs) for the Batcher."""
-        prompt_len = len(ep.prompt_token_ids)
-        all_ids = ep.prompt_token_ids + ep.token_ids
-        label_ids = [IGNORE_INDEX] * prompt_len + ep.token_ids
-        ref_logprobs = [0.0] * prompt_len + ep.token_logprobs
+    def _collate_episodes(
+        episodes: list[Episode], max_seq_length: int
+    ) -> list[TrainBatch]:
+        """Greedy-pack episodes into [1, L] TrainBatches using shared pack().
 
-        token_seqs = {
-            "input_ids": all_ids,
-            "label_ids": label_ids,
-            "ref_logprobs": ref_logprobs,
-        }
-        sample_attrs = {
-            "advantage": ep.advantage,
-            "reward": ep.reward,
-            "prompt_len": float(prompt_len),
-            "response_len": float(len(ep.token_ids)),
-            "token_logprobs": ep.token_logprobs,
-        }
-        return token_seqs, sample_attrs
+        Converts episodes to samples, feeds to pack() generator which
+        yields packed [1, L] dicts. Converts each to TrainBatch.
+        """
+
+        def _episode_samples():
+            for ep in episodes:
+                yield {"input_ids": ep.prompt_token_ids + ep.token_ids}
+
+        # Track per-episode metadata alongside pack() — pack() yields
+        # when the buffer is full, so we track which episodes went into
+        # each packed sequence.
+        train_batches: list[TrainBatch] = []
+        ep_idx = 0
+        for packed in pack(
+            _episode_samples(),
+            max_seq_length=max_seq_length,
+            pad_values={"input_ids": 0},
+        ):
+            seg_ids = packed["segment_ids"][0]
+            num_samples = seg_ids.max().item() + 1
+            num_valid = (seg_ids >= 0).sum().item()
+            group = episodes[ep_idx : ep_idx + num_samples]
+            ep_idx += num_samples
+
+            train_batches.append(
+                TrainBatch(
+                    token_ids=packed["input_ids"][0, :num_valid].unsqueeze(0),
+                    prompt_lens=[len(ep.prompt_token_ids) for ep in group],
+                    response_lens=[len(ep.token_ids) for ep in group],
+                    seq_lens=[
+                        len(ep.prompt_token_ids) + len(ep.token_ids) for ep in group
+                    ],
+                    advantages=torch.tensor(
+                        [ep.advantage for ep in group], dtype=torch.float32
+                    ),
+                    token_logprobs=[ep.token_logprobs for ep in group],
+                )
+            )
+
+        return train_batches
 
     def _shard_train_batches(
         self, train_batches: list[TrainBatch]
@@ -569,17 +498,6 @@ class RLTrainer(Configurable):
         # pull weights for policy version 0 (initial weights)
         self.generator.pull_model_state_dict.call(0).get()
 
-        # Initialize batcher with model's seq_len
-        self._batcher = Batcher(
-            microbatch_size=self.trainer_dp_degree,
-            max_seq_length=config.trainer.training.seq_len,
-            pad_values={
-                "input_ids": 0,
-                "label_ids": IGNORE_INDEX,
-                "ref_logprobs": 0.0,
-            },
-        )
-
     def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
         """Collect group rollouts: one single-use env per group, scored and returned."""
         envs = [
@@ -679,16 +597,10 @@ class RLTrainer(Configurable):
             if self.config.log_samples:
                 _log_samples(episodes)
 
-            # --- Batcher packed Episodes --- #
-            all_train_batches: list[TrainBatch] = []
-            for ep in episodes:
-                token_seqs, sample_attrs = self._episode_to_sample(ep)
-                flushed = self._batcher.add_sample(token_seqs, sample_attrs)
-                if flushed is not None:
-                    all_train_batches.append(flushed)
-            final = self._batcher.flush()
-            if final is not None:
-                all_train_batches.append(final)
+            # --- Pack episodes into TrainBatches --- #
+            all_train_batches = self._collate_episodes(
+                episodes, self.config.trainer.training.seq_len
+            )
 
             # per_rank[rank] = list of TrainBatches for that rank
             per_rank = self._shard_train_batches(all_train_batches)
