@@ -20,6 +20,7 @@ from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
+from torchtitan.hf_datasets.utils import pack
 from torchtitan.tools.logging import logger
 
 
@@ -325,11 +326,6 @@ class ChatDataset(IterableDataset, Stateful):
         # Variables for checkpointing
         self._sample_idx = 0
         self._epoch: int = 0
-        self._inputs_buffer: list[int] = []
-        self._labels_buffer: list[int] = []
-        self._positions_buffer: list[int] = []
-        self._pending_input_ids: list[int] = []
-        self._pending_label_ids: list[int] = []
 
         self._logged_first_sample = False
 
@@ -412,70 +408,17 @@ class ChatDataset(IterableDataset, Stateful):
         return input_ids, label_ids
 
     def __iter__(self):
-        yield from self._iter_greedy_packed()
-
-    def _iter_greedy_packed(self):
-        """Greedy packing: pack examples sequentially until seq_len is full.
-        Document boundaries are marked by EOS tokens between packed examples.
-        The model's flex/varlen attention mask uses these EOS positions to
-        prevent cross-document attention.
-        """
-        # resume from ckpt edge case
-        if self._pending_input_ids:
-            input_ids = self._pending_input_ids
-            label_ids = self._pending_label_ids
-            self._pending_input_ids = []
-            self._pending_label_ids = []
-            self._inputs_buffer.extend(input_ids)
-            self._labels_buffer.extend(label_ids)
-            self._positions_buffer.extend(range(len(input_ids)))
-            self._sample_idx += 1
-            if len(self._inputs_buffer) == self.seq_len:
-                yield self._flush_buffers()
+        """Yield individual tokenized samples. Packing is done by PackCollator."""
         while True:
             for sample in self._get_data_iter():
                 # pyrefly: ignore [bad-argument-type]
                 result = self._tokenize_sample(sample)
+                self._sample_idx += 1
                 if result is None:
-                    self._sample_idx += 1
                     continue
 
                 input_ids, label_ids = result
-                remaining = self.seq_len - len(self._inputs_buffer)
-
-                # If the example doesn't fit, pad and yield current buffer
-                if len(input_ids) > remaining and len(self._inputs_buffer) > 0:
-                    pad_len = remaining
-                    self._inputs_buffer.extend([self._eos_id] * pad_len)
-                    self._labels_buffer.extend([IGNORE_INDEX] * pad_len)
-                    self._positions_buffer.extend(range(pad_len))
-                    self._pending_input_ids = input_ids
-                    self._pending_label_ids = label_ids
-                    yield self._flush_buffers()
-                    # resumed generator continues here or fresh generator handles pending at top (resume path)
-                    input_ids = self._pending_input_ids
-                    label_ids = self._pending_label_ids
-                    self._pending_input_ids = []
-                    self._pending_label_ids = []
-
-                # Add example to buffer with positions resetting to 0
-                self._inputs_buffer.extend(input_ids)
-                self._labels_buffer.extend(label_ids)
-                self._positions_buffer.extend(range(len(input_ids)))
-                self._sample_idx += 1
-
-                if len(self._inputs_buffer) == self.seq_len:
-                    yield self._flush_buffers()
-
-            # Flush remaining buffer at end of data
-            if len(self._inputs_buffer) > 0:
-                pad_len = self.seq_len - len(self._inputs_buffer)
-                if pad_len > 0:
-                    self._inputs_buffer.extend([self._eos_id] * pad_len)
-                    self._labels_buffer.extend([IGNORE_INDEX] * pad_len)
-                    self._positions_buffer.extend(range(pad_len))
-
-                yield self._flush_buffers()
+                yield {"input_ids": input_ids, "label_ids": label_ids}
 
             if not self.infinite:
                 logger.warning(f"Chat dataset '{self._dataset_id}' has run out of data")
@@ -495,24 +438,9 @@ class ChatDataset(IterableDataset, Stateful):
                     f"(epoch {self._epoch})"
                 )
 
-    def _flush_buffers(self):
-        """Convert buffers to tensors, clear them, and return the batch."""
-        input_tensor = torch.tensor(self._inputs_buffer, dtype=torch.long)
-        label_tensor = torch.tensor(self._labels_buffer, dtype=torch.long)
-        positions_tensor = torch.tensor(self._positions_buffer, dtype=torch.long)
-        self._inputs_buffer = []
-        self._labels_buffer = []
-        self._positions_buffer = []
-        return {"input": input_tensor, "positions": positions_tensor}, label_tensor
-
     def state_dict(self):
         _state_dict: dict[str, Any] = {
             "epoch": self._epoch,
-            "inputs_buffer": self._inputs_buffer,
-            "labels_buffer": self._labels_buffer,
-            "positions_buffer": self._positions_buffer,
-            "pending_input_ids": self._pending_input_ids,
-            "pending_label_ids": self._pending_label_ids,
         }
 
         if isinstance(self._data, Dataset):
@@ -524,15 +452,17 @@ class ChatDataset(IterableDataset, Stateful):
 
     def load_state_dict(self, state_dict):
         self._epoch = state_dict["epoch"]
-        self._inputs_buffer = state_dict["inputs_buffer"]
-        self._labels_buffer = state_dict["labels_buffer"]
-        self._positions_buffer = state_dict["positions_buffer"]
-        self._pending_input_ids = state_dict["pending_input_ids"]
-        self._pending_label_ids = state_dict["pending_label_ids"]
+
+        if "inputs_buffer" in state_dict:
+            logger.warning(
+                "Checkpoint contains old packing buffer state "
+                "(inputs_buffer, pending_input_ids, etc.) which is no longer "
+                "used. Packing is now handled by PackCollator. A few in-flight "
+                "samples from the old buffer may be skipped on resume."
+            )
 
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
-            # Replay shuffles so _data matches the order at checkpoint time
             if self._epoch > 0:
                 self._data = cast(
                     Dataset, self._original_data.shuffle(seed=42 + self._epoch)
@@ -540,14 +470,65 @@ class ChatDataset(IterableDataset, Stateful):
         else:
             assert "data" in state_dict
             data_state = state_dict["data"]
-            # HuggingFace IterableDataset sync epoch
             saved_epoch = data_state.get("epoch", 0)
             self._data.set_epoch(saved_epoch)
             self._data.load_state_dict(data_state)
 
 
+class PackCollator:
+    """Collate function that packs individual samples via pack().
+
+    Receives batch_size individual samples from the DataLoader, calls pack()
+    to bin-pack them into [batch_size, seq_len] with segment_ids, then
+    derives positions from segment_ids for the trainer.
+    """
+
+    def __init__(self, seq_len: int, pad_id: int):
+        self._seq_len = seq_len
+        self._pad_id = pad_id
+        self._pad_values = {"input_ids": pad_id, "label_ids": IGNORE_INDEX}
+
+    def __call__(
+        self, samples: list[dict[str, list[int]]]
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        packed = pack(
+            token_seqs=[
+                {"input_ids": s["input_ids"], "label_ids": s["label_ids"]}
+                for s in samples
+            ],
+            sample_attrs=[{} for _ in samples],
+            max_seq_length=self._seq_len,
+            num_rows=len(samples),
+            pad_values=self._pad_values,
+        )
+
+        # Derive positions from segment_ids (cumcount within each segment)
+        segment_ids = packed.segment_ids
+        B, L = segment_ids.shape
+        positions = torch.zeros_like(segment_ids)
+        for b in range(B):
+            pos = 0
+            prev_seg = segment_ids[b, 0].item()
+            for t in range(L):
+                cur_seg = segment_ids[b, t].item()
+                if cur_seg != prev_seg:
+                    pos = 0
+                    prev_seg = cur_seg
+                positions[b, t] = pos
+                pos += 1
+
+        return (
+            {"input": packed.token_seqs["input_ids"], "positions": positions},
+            packed.token_seqs["label_ids"],
+        )
+
+
 class ChatDataLoader(ParallelAwareDataloader):
-    """Chat dataloader for instruction/conversation datasets."""
+    """Chat dataloader for instruction/conversation datasets.
+
+    Uses PackCollator to bin-pack individual samples from ChatDataset
+    into [batch_size, seq_len] tensors via the shared pack() function.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(ParallelAwareDataloader.Config):
@@ -592,12 +573,15 @@ class ChatDataLoader(ParallelAwareDataloader):
             infinite=config.infinite,
         )
 
+        collate_fn = PackCollator(seq_len=seq_len, pad_id=tokenizer.eos_id)
+
         dataloader_kwargs = {
             "num_workers": config.num_workers,
             "persistent_workers": config.persistent_workers,
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
             "batch_size": local_batch_size,
+            "collate_fn": collate_fn,
         }
 
         super().__init__(
