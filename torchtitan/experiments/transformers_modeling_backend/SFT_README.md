@@ -351,41 +351,181 @@ attn_implementation = "flex_torchtitan"
 
 ## Parallelism Support
 
-| Parallelism | Status | Notes |
-|---|---|---|
-| FSDP | Works | Standard data parallel sharding |
-| FSDP + TP | Works | BlockMask built before SP split |
-| FSDP + TP + PP | Works | BlockMask forwarded across PP stages |
-| FSDP + compile | Works | Custom attention avoids warnings.warn graph break |
-| FSDP + TP + compile | Works | cache_size_limit=64 for HF code complexity |
-| FSDP + AC (selective/full) | Works | Standard activation checkpointing |
-| FSDP + CP | Works | K/V all-gather in attention forward, ptrr load balancer |
+| Parallelism | Status | Changes for SFT | Why |
+|---|---|---|---|
+| FSDP | Works | None | Operates on weights, not masks |
+| FSDP + TP | Works | BlockMask built before SP split (SFTTrainer) | SP changes input shape |
+| FSDP + TP + PP | Works | None | BlockMask in extra_kwargs, forwarded automatically |
+| FSDP + compile | Works | Custom attention fn + cache limit (model.py) | HF code breaks dynamo |
+| FSDP + TP + compile | Works | cache_size_limit=64 (model.py) | HF code complexity |
+| FSDP + AC (selective/full) | Works | None | Operates on activations, not masks |
+| FSDP + CP | Works | K/V all-gather + ptrr (model.py + trainer.py) | HF doesn't use native FlexAttention module |
+
+### Parallelisms That Work Out of the Box
+
+**FSDP** shards model weights across GPUs. Each GPU stores a fraction of each
+weight matrix and all-gathers the full weight before each layer's forward pass.
+This operates entirely on weights — it doesn't interact with the attention mask
+or data pipeline. SFT's BlockMask passes through FSDP untouched.
+
+**PP (Pipeline Parallel)** splits layers across GPUs. GPU 0 runs layers 0-15,
+GPU 1 runs layers 16-31. The BlockMask is in `extra_kwargs`, which PP
+automatically forwards to all stages. Every stage's attention layers receive
+the same BlockMask. No changes needed — we just put the mask in `extra_kwargs`
+(forwarded to all stages) instead of `extra_inputs` (first stage only).
+
+**AC (Activation Checkpointing)** discards intermediate activations during
+forward to save memory, then recomputes them during backward. This operates on
+layer activations, not on the attention mask. The BlockMask is an input to
+each layer, not a saved activation, so AC has no interaction with SFT.
 
 ### Why TP Required Special Handling
 
-With TP + Sequence Parallel, the input is split along the sequence dimension
-before the model's `forward()` runs. If HF builds the mask inside `forward()`
-(as it does with `attn_implementation="flex_attention"`), it sees the split
-sequence length (e.g., 1024 instead of 2048) and builds a mask for the wrong
-size. Our approach builds the mask in `post_dataloading_process` (before the
-split) so it always sees the full sequence length.
+**TP (Tensor Parallel)** splits weight matrices across GPUs — each GPU computes
+a slice of Q, K, V, and MLP outputs. TP itself needed no changes for SFT.
+
+The issue is **Sequence Parallel (SP)**, which is enabled alongside TP. SP
+splits the input along the sequence dimension for non-attention operations
+(LayerNorm, Dropout). With seq_len=2048 and TP=2, each GPU gets 1024 tokens.
+
+If HF builds the mask inside `forward()` (as it does with
+`attn_implementation="flex_attention"`), it sees the split sequence length
+(1024) and builds a mask for the wrong size. Inside the attention layer, Q/K/V
+are all-gathered back to 2048, but the mask says 1024 → crash.
+
+Our approach builds the mask in `post_dataloading_process` (before SP splits
+the input) so it always sees the full sequence length (2048). This is why we
+use the custom name `"flex_torchtitan"` — it prevents HF from building its own
+mask at the wrong point.
 
 ### Why CP Required Special Handling
 
-CP shards the sequence across GPUs. Each GPU computes attention for its local
-query chunk against the full K/V from all GPUs. Native TorchTitan wraps the
-`FlexAttention` module's `forward` to all-gather K/V, but HF models don't use
-TorchTitan's `FlexAttention` module. Our `_flex_torchtitan_attention_forward`
-does the all-gather directly when CP is active. Note: HF uses layout
-`(batch, heads, seq, dim)` so the gather is along dim 2 (sequence), not dim 1
-as in native TorchTitan's `(batch, seq, heads, dim)` layout.
+#### What CP does
+
+CP splits the sequence across GPUs. With 2 GPUs and seq_len=2048, each GPU
+gets 1024 tokens. But attention needs every query to potentially see every key —
+token 500 (GPU 0) might need to attend to token 1500 (GPU 1).
+
+CP solves this by keeping Q local but **all-gathering K,V from all GPUs**:
+
+```
+GPU 0:
+  Q  = local [tokens 0-1023]
+  K,V = all_gather → [tokens 0-2047]    ← full sequence
+  attention(Q=1024, KV=2048)             → output for tokens 0-1023
+
+GPU 1:
+  Q  = local [tokens 1024-2047]
+  K,V = all_gather → [tokens 0-2047]    ← full sequence
+  attention(Q=1024, KV=2048)             → output for tokens 1024-2047
+```
+
+The BlockMask is split along Q only (each GPU's queries), but KV stays full:
+
+```
+Full BlockMask (2048 × 2048):        GPU 0's BlockMask (1024 × 2048):
+     KV: 0────────────2048                KV: 0────────────2048
+Q: 0    [ConvA |      ]            Q: 0    [ConvA |      ]
+        [      |      ]                    [      |      ]
+Q:1024  [      | ConvB ]            GPU 1's BlockMask (1024 × 2048):
+        [      |      ]                 KV: 0────────────2048
+Q:2048                              Q:1024  [      | ConvB ]
+                                           [      |      ]
+```
+
+#### Why native CP wrapping doesn't work for HF models
+
+In native TorchTitan, `apply_cp_to_forward()` wraps each `FlexAttention`
+module's forward to all-gather K,V:
+
+```python
+if isinstance(first, FlexAttention):       # checks for native module
+    def cp_forward(q, k, v):
+        global_k, global_v = flex_cp_allgather(k, v, dim=1)
+        return orig_fn(q, global_k, global_v)
+    mod.forward = cp_forward
+```
+
+But HF models don't use TorchTitan's `FlexAttention` module. They have their
+own attention classes (`LlamaAttention`, `Qwen3Attention`, etc.) that dispatch
+to our `_flex_torchtitan_attention_forward` via `AttentionInterface`. The
+`isinstance(first, FlexAttention)` check fails, so the CP wrapping never gets
+applied. K,V stay local (1024), but the BlockMask expects full KV (2048) →
+size mismatch → crash.
+
+#### Our fix
+
+We put the all-gather directly inside `_flex_torchtitan_attention_forward`:
+
+```python
+if _cp_mesh is not None:
+    key, value = flex_cp_allgather(key, value, 2, pg_name)
+    #                                         ^ dim 2, not dim 1
+```
+
+Note **dim 2** instead of dim 1. This is because HF and native TorchTitan use
+different tensor layouts:
+
+```
+Native TorchTitan: (batch, seq, heads, dim) → sequence is dim 1
+HF models:         (batch, heads, seq, dim) → sequence is dim 2
+```
+
+The `_cp_mesh` global is set when the model's `set_cp_mesh()` is called during
+trainer init. We also switch the load balancer to `"ptrr"` for block-causal
+masks, which distributes work evenly across CP ranks accounting for the
+BlockMask sparsity pattern.
+
+#### The full CP flow
+
+```
+1. SFTTrainer.post_dataloading_process:
+   - Build BlockMask for full seq_len (2048 × 2048)
+   - prepare_context_parallel_input with ptrr load balancer:
+     - Shards input:    [batch, 2048] → [batch, 1024] per rank
+     - Shards positions: [batch, 2048] → [batch, 1024] per rank
+     - Shards BlockMask along Q dim: (2048, 2048) → (1024, 2048) per rank
+
+2. Model forward:
+   - Each rank processes its local chunk through embeddings + layers
+   - Q, K, V are all [batch, heads, 1024, dim] (local chunk)
+
+3. _flex_torchtitan_attention_forward:
+   - Detects _cp_mesh is set
+   - All-gathers K: [batch, heads, 1024, dim] → [batch, heads, 2048, dim]
+   - All-gathers V: [batch, heads, 1024, dim] → [batch, heads, 2048, dim]
+   - Q stays local:  [batch, heads, 1024, dim]
+   - BlockMask:      (1024, 2048) — local Q, full KV
+   - flex_attention(Q=1024, K=2048, V=2048, mask=(1024, 2048)) → works ✓
+```
 
 ### Why compile Required Special Handling
 
-HF's `flex_attention_forward` passes `return_lse=True` to PyTorch's
-`flex_attention`, which triggers `warnings.warn` inside PyTorch. Dynamo can't
-trace `warnings.warn`, causing a compilation failure. Our attention forward
-function calls `flex_attention` directly without `return_lse`.
+`torch.compile` traces Python code into a computation graph, then generates
+fused GPU kernels. Two issues arose with SFT:
+
+**Problem 1: `warnings.warn` graph break.** HF's `flex_attention_forward`
+passes `return_lse=True` to PyTorch's `flex_attention`, which internally calls
+`warnings.warn` about a deprecation. Dynamo can't trace `warnings.warn` — it's
+a Python builtin that dynamo marks as "skipped." This causes a graph break,
+which fails with `fullgraph=True`. Our `_flex_torchtitan_attention_forward`
+calls `flex_attention` directly without `return_lse`, avoiding the warning.
+
+**Problem 2: Recompilation limit with TP.** When `torch.compile` traces a
+function, it records "guards" — conditions under which the compiled graph is
+valid (input shapes, types, dtypes). If a guard fails on the next call, dynamo
+recompiles. HF model code has more Python conditionals, wrappers, and dispatch
+logic than native TorchTitan, creating more guards. During the first few
+training steps, TP's async collectives produce different tensor types
+(`AsyncCollectiveTensor` vs `Tensor`) as communication patterns stabilize.
+More guards × more type variations = more recompilations. The default limit of
+8 was too low; we set `cache_size_limit=64` to let the guards stabilize. After
+3-5 steps, no more recompilation occurs — the cache has all the graphs it
+needs.
+
+Note: pretraining with TP + compile works at the default limit because native
+TorchTitan model code is simpler (fewer guards). The higher limit is specific
+to HF models' more complex Python code paths.
 
 ## Models Tested
 
