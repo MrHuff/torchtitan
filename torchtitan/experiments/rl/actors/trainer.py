@@ -274,7 +274,7 @@ class PolicyTrainer(Actor, Configurable):
         local_batch = train_data[self.dp_rank]
         device = self.device
 
-        token_ids = local_batch.token_ids.to(device)
+        token_ids = local_batch.token_ids.to(device)  # [B, L]
         seq_lens = local_batch.seq_lens
         prompt_lens = local_batch.prompt_lens
         response_lens = local_batch.response_lens
@@ -289,15 +289,33 @@ class PolicyTrainer(Actor, Configurable):
                 f"generation max_tokens."
             )
 
-        positions = torch.cat(
-            [torch.arange(l, device=device) for l in seq_lens]
-        ).unsqueeze(0)
+        # Build [B, L] positions from token_ids shape — detect document
+        # boundaries via create_varlen_metadata_for_document which scans
+        # for position resets. For [B, L] with padding, positions are
+        # built per row from seq_lens.
+        B, L = token_ids.shape
+        positions = torch.zeros(B, L, dtype=torch.long, device=device)
+        sample_idx = 0
+        for b in range(B):
+            col = 0
+            while sample_idx < len(seq_lens) and col + seq_lens[sample_idx] <= L:
+                sl = seq_lens[sample_idx]
+                positions[b, col : col + sl] = torch.arange(sl, device=device)
+                col += sl
+                sample_idx += 1
+
         attention_masks = create_varlen_metadata_for_document(positions)
 
         logits = self.model(
             token_ids, attention_masks=attention_masks, positions=positions
         )
-        all_policy_logprobs = compute_logprobs(logits, token_ids)
+
+        # Flatten [B, L] → [1, B*L] for extract_response_logprobs which
+        # expects flat varlen indexing.
+        flat_token_ids = token_ids.reshape(1, -1)
+        all_policy_logprobs = compute_logprobs(
+            logits.reshape(1, B * L, -1), flat_token_ids
+        )
         policy_logprobs = extract_response_logprobs(
             all_policy_logprobs, seq_lens, prompt_lens, response_lens
         )

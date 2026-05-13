@@ -26,8 +26,9 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+from itertools import islice
 
 # must run before torch import
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -165,6 +166,96 @@ def _log_samples(items: list[Episode] | list[Completion]) -> None:
         logger.info(f"       A: {item.text[:300].replace(chr(10), ' ').strip()}")
 
 
+class Batcher(Configurable):
+    """Packs variable-length samples into [microbatch_size, max_seq_length] microbatches.
+
+    Wraps the shared pack() generator: calls it to produce [1, L] packed
+    sequences, collects microbatch_size of them, and stacks into [B, L].
+    Each stacked microbatch becomes a list[TrainBatch] (one per row) for
+    distribution across DP ranks.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        microbatch_size: int = 1
+        """Number of packed rows per microbatch."""
+
+        max_seq_length: int = 2048
+        """Maximum tokens per packed row."""
+
+    def __init__(self, config: Config):
+        self.microbatch_size = config.microbatch_size
+        self.max_seq_length = config.max_seq_length
+
+    def batch(self, episodes: list[Episode]) -> list[TrainBatch]:
+        """Pack episodes into [microbatch_size, max_seq_length] TrainBatches.
+
+        Calls pack() to produce [1, L] packed rows, stacks microbatch_size
+        of them into one TrainBatch per microbatch. Returns a list for
+        gradient accumulation.
+        """
+
+        def _episode_samples() -> Iterator[dict[str, list]]:
+            for ep in episodes:
+                yield {"input_ids": ep.prompt_token_ids + ep.token_ids}
+
+        pack_gen = pack(
+            _episode_samples(),
+            max_seq_length=self.max_seq_length,
+            pad_values={"input_ids": 0},
+        )
+
+        # Collect packed [1, L] rows with their episode metadata
+        rows: list[dict] = []
+        row_episodes: list[list[Episode]] = []
+        ep_idx = 0
+        for packed in pack_gen:
+            segment_ids = packed["segment_ids"][0]
+            num_samples = segment_ids.max().item() + 1
+            group = episodes[ep_idx : ep_idx + num_samples]
+            ep_idx += num_samples
+            rows.append(packed)
+            row_episodes.append(group)
+
+        # Stack microbatch_size rows into [B, L] TrainBatches
+        train_batches: list[TrainBatch] = []
+        for i in range(0, len(rows), self.microbatch_size):
+            chunk_rows = rows[i : i + self.microbatch_size]
+            chunk_eps = row_episodes[i : i + self.microbatch_size]
+
+            token_ids = torch.cat([r["input_ids"] for r in chunk_rows])
+            all_prompt_lens = [
+                len(ep.prompt_token_ids) for group in chunk_eps for ep in group
+            ]
+            all_response_lens = [
+                len(ep.token_ids) for group in chunk_eps for ep in group
+            ]
+            all_advantages = [
+                ep.advantage for group in chunk_eps for ep in group
+            ]
+            all_logprobs = [
+                ep.token_logprobs for group in chunk_eps for ep in group
+            ]
+
+            train_batches.append(
+                TrainBatch(
+                    token_ids=token_ids,
+                    prompt_lens=all_prompt_lens,
+                    response_lens=all_response_lens,
+                    seq_lens=[
+                        p + r
+                        for p, r in zip(all_prompt_lens, all_response_lens)
+                    ],
+                    advantages=torch.tensor(
+                        all_advantages, dtype=torch.float32
+                    ),
+                    token_logprobs=all_logprobs,
+                )
+            )
+
+        return train_batches
+
+
 class RLTrainer(Configurable):
     """Top-level RL training orchestrator."""
 
@@ -207,6 +298,9 @@ class RLTrainer(Configurable):
         compile: CompileConfig = field(default_factory=CompileConfig)
         """torch.compile config shared by trainer and generator."""
 
+        batcher: Batcher.Config = field(default_factory=Batcher.Config)
+        """Batcher config for packing episodes into microbatches."""
+
         trainer: PolicyTrainer.Config = field(
             default_factory=lambda: PolicyTrainer.Config(loss=GRPOLoss.Config())
         )
@@ -243,6 +337,7 @@ class RLTrainer(Configurable):
         self.trainer = None
         self.generator = None
         self._proc_meshes = []
+        self._batcher = config.batcher.build()
 
     async def close(self):
         """Best-effort: tear down actors, then stop proc meshes."""
@@ -291,53 +386,6 @@ class RLTrainer(Configurable):
             * p.pipeline_parallel_degree
             * p.context_parallel_degree
         )
-
-    @staticmethod
-    def _collate_episodes(
-        episodes: list[Episode], max_seq_length: int
-    ) -> list[TrainBatch]:
-        """Greedy-pack episodes into [1, L] TrainBatches using shared pack().
-
-        Converts episodes to samples, feeds to pack() generator which
-        yields packed [1, L] dicts. Converts each to TrainBatch.
-        """
-
-        def _episode_samples():
-            for ep in episodes:
-                yield {"input_ids": ep.prompt_token_ids + ep.token_ids}
-
-        # Track per-episode metadata alongside pack() — pack() yields
-        # when the buffer is full, so we track which episodes went into
-        # each packed sequence.
-        train_batches: list[TrainBatch] = []
-        ep_idx = 0
-        for packed in pack(
-            _episode_samples(),
-            max_seq_length=max_seq_length,
-            pad_values={"input_ids": 0},
-        ):
-            seg_ids = packed["segment_ids"][0]
-            num_samples = seg_ids.max().item() + 1
-            num_valid = (seg_ids >= 0).sum().item()
-            group = episodes[ep_idx : ep_idx + num_samples]
-            ep_idx += num_samples
-
-            train_batches.append(
-                TrainBatch(
-                    token_ids=packed["input_ids"][0, :num_valid].unsqueeze(0),
-                    prompt_lens=[len(ep.prompt_token_ids) for ep in group],
-                    response_lens=[len(ep.token_ids) for ep in group],
-                    seq_lens=[
-                        len(ep.prompt_token_ids) + len(ep.token_ids) for ep in group
-                    ],
-                    advantages=torch.tensor(
-                        [ep.advantage for ep in group], dtype=torch.float32
-                    ),
-                    token_logprobs=[ep.token_logprobs for ep in group],
-                )
-            )
-
-        return train_batches
 
     def _shard_train_batches(
         self, train_batches: list[TrainBatch]
@@ -597,22 +645,15 @@ class RLTrainer(Configurable):
             if self.config.log_samples:
                 _log_samples(episodes)
 
-            # --- Pack episodes into TrainBatches --- #
-            all_train_batches = self._collate_episodes(
-                episodes, self.config.trainer.training.seq_len
-            )
-
-            # per_rank[rank] = list of TrainBatches for that rank
-            per_rank = self._shard_train_batches(all_train_batches)
-            num_microbatches = max(len(r) for r in per_rank)
+            # --- Pack and train --- #
+            # Batcher packs episodes into [microbatch_size, L] TrainBatches.
+            # Each TrainBatch is one gradient accumulation step.
+            microbatches = self._batcher.batch(episodes)
 
             all_fwd_bwd_metrics = []
-            for mb_idx in range(num_microbatches):
-                train_batches = [
-                    per_rank[rank][mb_idx] for rank in range(self.trainer_dp_degree)
-                ]
+            for mb in microbatches:
                 fwd_bwd_metrics = self._get_rank_0_value(
-                    self.trainer.forward_backward.call(train_batches).get()
+                    self.trainer.forward_backward.call([mb]).get()
                 )
                 all_fwd_bwd_metrics.append(fwd_bwd_metrics)
             optim_metrics = self._get_rank_0_value(self.trainer.optim_step.call().get())
