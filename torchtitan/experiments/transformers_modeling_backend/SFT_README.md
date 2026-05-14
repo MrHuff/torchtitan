@@ -198,42 +198,41 @@ sets EOS explicitly.
 
 ### Modified Files
 
-#### `model.py` — _flex_torchtitan_attention_forward + changes
+#### `model.py` — HFFlexAttention + _flex_torchtitan_attention_forward
 
-**Custom attention forward function:**
+**`HFFlexAttention`** subclasses TorchTitan's `FlexAttention` kernel module.
+It accepts Q/K/V in native TorchTitan layout `(batch, seq, heads, dim)`,
+transposes to `(batch, heads, seq, dim)` for the `flex_attention` kernel, and
+transposes back. Each HF attention layer gets one registered as a submodule
+via `register_module("_flex_kernel", ...)` during model init. This makes
+`apply_cp_to_forward`'s isinstance check pass, so CP wrapping applies
+automatically — no globals needed.
+
+**`_flex_torchtitan_attention_forward`** is the function registered via
+`AttentionInterface`. It transposes Q/K/V from HF layout to native layout,
+calls the `HFFlexAttention` module (which may have been wrapped by
+`apply_cp_to_forward` for K/V all-gather), and transposes back:
 
 ```python
-def _flex_torchtitan_attention_forward(
-    module, query, key, value, attention_mask, **kwargs
-):
-    block_mask = attention_mask if isinstance(attention_mask, BlockMask) else None
-    out = flex_attention(query, key, value, block_mask=block_mask,
-                         scale=scaling, enable_gqa=True)
-    return out, None
+def _flex_torchtitan_attention_forward(module, query, key, value, ...):
+    flex_module = module._flex_kernel           # attached HFFlexAttention
+    q = query.transpose(1, 2)                   # HF → native layout
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
+    out = flex_module(q, k, v, attention_masks=block_mask, scale=scaling)
+    return out.transpose(1, 2), None            # native → HF layout
 ```
 
 **Why not use HF's `flex_attention_forward`?** Two reasons:
 
 1. HF's version passes `return_lse=True` to PyTorch's `flex_attention`, which
    triggers `warnings.warn` inside PyTorch. `torch.compile`'s dynamo can't
-   trace `warnings.warn`, causing a graph break and compilation failure. Our
-   function avoids `return_lse` entirely.
+   trace `warnings.warn`, causing a graph break and compilation failure.
 
 2. By using a custom name `"flex_torchtitan"` (not registered in HF's mask
    registry), HF's `create_causal_mask` skips building its own mask. This is
    critical for TP + Sequence Parallel — HF would build the mask at the wrong
    sequence length (after SP has split the input).
-
-**Context Parallel support:** When CP is active, K/V are all-gathered before
-attention:
-
-```python
-if _cp_mesh is not None:
-    key, value = flex_cp_allgather(key, value, 2, pg_name)
-    #                                         ^ dim 2 = sequence
-    # HF layout: (batch, heads, seq, dim) — dim 2 is sequence
-    # Native TorchTitan layout: (batch, seq, heads, dim) — dim 1 is sequence
-```
 
 **Attention registration in `_configure_hf_attention`:**
 
@@ -258,6 +257,27 @@ kwargs. When provided, passes them to the HF model. Falls back to sequential
   complexity (conditionals, wrappers, dispatch) than native TorchTitan, causing
   more dynamo guard variations during TP warmup. The default limit of 8 is too
   low; 64 gives room to stabilize.
+
+**`HFFlexAttention` class:** Subclasses TorchTitan's `FlexAttention` kernel
+module. This is what makes CP work — `apply_cp_to_forward` checks
+`isinstance(module, FlexAttention)`, which passes for our subclass. The module
+accepts Q/K/V in native TorchTitan layout `(batch, seq, heads, dim)`,
+transposes to `(batch, heads, seq, dim)` for the `flex_attention` kernel, and
+transposes back. `_flex_torchtitan_attention_forward` handles the HF↔native
+layout conversion before/after calling this module.
+
+Each HF attention layer gets an `HFFlexAttention` instance registered as a
+submodule during model init:
+
+```python
+layer.self_attn.register_module(
+    "_flex_kernel", HFFlexAttention(config=HFFlexAttention.Config())
+)
+```
+
+Using `register_module` (not plain attribute assignment) makes it a proper
+`nn.Module` submodule — visible to `named_modules()`, moved by `.to(device)`,
+included in `state_dict()`.
 
 - `attention_dropout = 0.0`: FlexAttention doesn't support dropout. Models like
   Seed-Coder have `attention_dropout=0.1` by default.
@@ -313,6 +333,28 @@ Two new config functions:
   `initial_load_in_hf=True`. Default: Qwen3-0.6B.
 
 Both use `HFBackendTokenizer` for chat template compatibility.
+
+#### `parallelize.py` — CP wrapping
+
+Added `apply_cp_to_forward` call when CP is enabled. Collects the
+`HFFlexAttention` modules from each HF attention layer and passes them to
+`apply_cp_to_forward`, which wraps each module's `forward` to all-gather K/V
+before attention:
+
+```python
+if parallel_dims.cp_enabled:
+    model.set_cp_mesh(parallel_dims.get_mesh("cp"))
+    flex_modules = []
+    for layer in model.layers.values():
+        if hasattr(layer.self_attn, "_flex_kernel"):
+            flex_modules.append(layer.self_attn._flex_kernel)
+    if flex_modules:
+        apply_cp_to_forward(flex_modules, parallel_dims.get_mesh("cp"))
+```
+
+This follows the same pattern as native model parallelization (e.g.,
+`llama3/parallelize.py`) where `apply_cp_to_forward` is called with the inner
+attention modules before `parallelize_module()`.
 
 ## How the Attention Path Works End-to-End
 
@@ -433,48 +475,43 @@ Q:2048                              Q:1024  [      | ConvB ]
                                            [      |      ]
 ```
 
-#### Why native CP wrapping doesn't work for HF models
+#### How CP wrapping works
 
-In native TorchTitan, `apply_cp_to_forward()` wraps each `FlexAttention`
-module's forward to all-gather K,V:
+`apply_cp_to_forward()` wraps each `FlexAttention` module's forward to
+all-gather K,V before attention:
 
 ```python
-if isinstance(first, FlexAttention):       # checks for native module
+if isinstance(first, FlexAttention):       # checks for FlexAttention module
     def cp_forward(q, k, v):
-        global_k, global_v = flex_cp_allgather(k, v, dim=1)
+        global_k, global_v = flex_cp_allgather(k, v, dim=1)  # dim 1 = seq in native layout
         return orig_fn(q, global_k, global_v)
     mod.forward = cp_forward
 ```
 
-But HF models don't use TorchTitan's `FlexAttention` module. They have their
-own attention classes (`LlamaAttention`, `Qwen3Attention`, etc.) that dispatch
-to our `_flex_torchtitan_attention_forward` via `AttentionInterface`. The
-`isinstance(first, FlexAttention)` check fails, so the CP wrapping never gets
-applied. K,V stay local (1024), but the BlockMask expects full KV (2048) →
-size mismatch → crash.
+HF models don't have TorchTitan's `FlexAttention` module — they have their own
+attention classes (`LlamaAttention`, `Qwen3Attention`). To make
+`apply_cp_to_forward` work, we:
 
-#### Our fix
+1. **Subclass `FlexAttention`** as `HFFlexAttention` — passes the isinstance
+   check
+2. **Register it as a submodule** on each HF attention layer via
+   `register_module("_flex_kernel", ...)`
+3. **Collect these modules** in `parallelize.py` and pass them to
+   `apply_cp_to_forward`
 
-We put the all-gather directly inside `_flex_torchtitan_attention_forward`:
+The layout difference is handled by transposes:
+- `_flex_torchtitan_attention_forward` transposes Q/K/V from HF layout
+  `(batch, heads, seq, dim)` to native layout `(batch, seq, heads, dim)`
+  before calling the module
+- `apply_cp_to_forward`'s all-gather runs on dim 1 (sequence in native layout)
+  — correct
+- `HFFlexAttention.forward` transposes back to `(batch, heads, seq, dim)` for
+  the `flex_attention` kernel, then transposes the output back to native layout
+- `_flex_torchtitan_attention_forward` transposes the final output back to HF
+  layout
 
-```python
-if _cp_mesh is not None:
-    key, value = flex_cp_allgather(key, value, 2, pg_name)
-    #                                         ^ dim 2, not dim 1
-```
-
-Note **dim 2** instead of dim 1. This is because HF and native TorchTitan use
-different tensor layouts:
-
-```
-Native TorchTitan: (batch, seq, heads, dim) → sequence is dim 1
-HF models:         (batch, heads, seq, dim) → sequence is dim 2
-```
-
-The `_cp_mesh` global is set when the model's `set_cp_mesh()` is called during
-trainer init. We also switch the load balancer to `"ptrr"` for block-causal
-masks, which distributes work evenly across CP ranks accounting for the
-BlockMask sparsity pattern.
+We also switch the load balancer from `"headtail"` to `"ptrr"` for
+block-causal masks in `SFTTrainer.post_dataloading_process`.
 
 #### The full CP flow
 
@@ -488,15 +525,17 @@ BlockMask sparsity pattern.
 
 2. Model forward:
    - Each rank processes its local chunk through embeddings + layers
-   - Q, K, V are all [batch, heads, 1024, dim] (local chunk)
+   - Q, K, V are all (batch, heads, 1024, dim) in HF layout (local chunk)
 
 3. _flex_torchtitan_attention_forward:
-   - Detects _cp_mesh is set
-   - All-gathers K: [batch, heads, 1024, dim] → [batch, heads, 2048, dim]
-   - All-gathers V: [batch, heads, 1024, dim] → [batch, heads, 2048, dim]
-   - Q stays local:  [batch, heads, 1024, dim]
-   - BlockMask:      (1024, 2048) — local Q, full KV
+   - Transposes Q/K/V from HF layout to native layout
+   - Calls HFFlexAttention module (which apply_cp_to_forward has wrapped)
+   - CP wrapper all-gathers K/V along dim 1 (seq in native layout):
+     K: (batch, 1024, heads, dim) → (batch, 2048, heads, dim)
+     V: (batch, 1024, heads, dim) → (batch, 2048, heads, dim)
+   - HFFlexAttention transposes to (batch, heads, seq, dim) for kernel
    - flex_attention(Q=1024, K=2048, V=2048, mask=(1024, 2048)) → works ✓
+   - Transposes back through native layout to HF layout
 ```
 
 ### Why compile Required Special Handling
