@@ -22,43 +22,84 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import AttentionInterface, PreTrainedModel
 
+from torch.nn.attention.flex_attention import BlockMask
+
+from torchtitan.models.common.attention import FlexAttention
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import ModuleDict
 from torchtitan.tools.logging import logger
 
 
-_cp_mesh = None
+class HFFlexAttention(FlexAttention):
+    """FlexAttention kernel for HF models.
+
+    Accepts Q/K/V in native TorchTitan layout (batch, seq, heads, dim) so that
+    apply_cp_to_forward's K/V all-gather (dim=1, the seq dim) works correctly.
+    The caller (_flex_torchtitan_attention_forward) transposes from HF layout
+    before calling this module, and transposes back after.
+
+    This subclass passes the isinstance(FlexAttention) check in
+    apply_cp_to_forward, so CP wrapping works naturally.
+    """
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_masks: BlockMask | None = None,
+        scale: float | None = None,
+        enable_gqa: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        # Transpose to (batch, heads, seq, dim) for flex_attention kernel
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        out = flex_attention(
+            q,
+            k,
+            v,
+            block_mask=attention_masks,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+        # Transpose back to (batch, seq, heads, dim)
+        return out.transpose(1, 2)
 
 
 def _flex_torchtitan_attention_forward(
     module, query, key, value, attention_mask, **kwargs
 ):
-    """FlexAttention forward that is compile-friendly.
+    """FlexAttention forward registered via AttentionInterface.
 
-    HF's flex_attention_forward passes return_lse=True which triggers a
-    deprecated warnings.warn in PyTorch's flex_attention, breaking dynamo.
-    This avoids that by not requesting LSE.
+    Routes the kernel call through the HFFlexAttention module attached to
+    each HF attention layer, so apply_cp_to_forward's K/V all-gather wrapping
+    applies automatically.
 
-    When context parallel is active, all-gathers K/V before attention.
+    Transposes Q/K/V from HF layout (batch, heads, seq, dim) to native
+    TorchTitan layout (batch, seq, heads, dim) before calling the module,
+    so CP's dim=1 all-gather targets the sequence dimension correctly.
     """
-    from torch.nn.attention.flex_attention import BlockMask, flex_attention
-
-    if _cp_mesh is not None:
-        from torch.distributed.tensor.experimental._context_parallel._attention import (
-            flex_cp_allgather,
-        )
-        import torch.distributed as dist
-
-        pg_name = dist._get_process_group_name(_cp_mesh.get_group())
-        key = key.contiguous()
-        value = value.contiguous()
-        # HF layout is (batch, heads, seq, dim) — gather along seq dim (2)
-        key, value = flex_cp_allgather(key, value, 2, pg_name)
-
     scaling = kwargs.get("scaling")
-
     block_mask = attention_mask if isinstance(attention_mask, BlockMask) else None
+
+    flex_module = getattr(module, "_flex_kernel", None)
+    if flex_module is not None:
+        # HF layout → native layout: (batch, heads, seq, dim) → (batch, seq, heads, dim)
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        out = flex_module(
+            q, k, v, attention_masks=block_mask, scale=scaling
+        )
+        # Native layout → HF layout
+        return out.transpose(1, 2), None
+
+    # Fallback: call flex_attention directly (no CP support)
+    from torch.nn.attention.flex_attention import flex_attention
 
     out = flex_attention(
         query, key, value, block_mask=block_mask, scale=scaling, enable_gqa=True
@@ -412,11 +453,15 @@ class HFTransformerModel(BaseModel):
 
         for layer in self.model.model.layers.values():
             layer.moe_enabled = False
+            # Attach FlexAttention kernel module to each attention layer
+            # so apply_cp_to_forward can find and wrap it for CP.
+            if hasattr(layer, "self_attn") and config.attn_implementation == "flex_torchtitan":
+                layer.self_attn._flex_kernel = HFFlexAttention(
+                    config=HFFlexAttention.Config()
+                )
 
     def set_cp_mesh(self, mesh):
-        global _cp_mesh
         self.cp_mesh = mesh
-        _cp_mesh = mesh
 
     def _patch_hf_llama_like(self, decoder_layer_cls, attention_cls, mlp_cls=None):
         """
