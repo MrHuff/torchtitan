@@ -26,9 +26,8 @@ import logging
 import math
 import os
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from itertools import islice
 
 # must run before torch import
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -60,11 +59,7 @@ logger = logging.getLogger(__name__)
 
 
 class GRPOLoss(Configurable):
-    """Clipped GRPO surrogate loss.
-
-    Takes per-sample response logprobs (already extracted from whatever
-    packing or padding format the trainer uses).
-    """
+    """Clipped GRPO surrogate loss operating on [B, L] tensors."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -76,28 +71,26 @@ class GRPOLoss(Configurable):
 
     def __call__(
         self,
-        policy_logprobs: list[torch.Tensor],
+        policy_logprobs: torch.Tensor,
+        response_mask: torch.Tensor,
         advantages: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        per_sample_mean_lps = []
-        for policy_lps in policy_logprobs:
-            per_sample_mean_lps.append(policy_lps.mean())
-
-        mean_log_ratio = torch.stack(per_sample_mean_lps)
-        ratio = torch.exp(mean_log_ratio)
+        # Per-token log ratio (masked to response tokens only)
+        ratio = torch.exp(policy_logprobs * response_mask)
 
         unclipped_loss = ratio * advantages
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
         clipped_loss = clipped_ratio * advantages
-        pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+
+        num_response_tokens = response_mask.sum().clamp(min=1)
+        pg_loss = -(torch.min(unclipped_loss, clipped_loss) * response_mask).sum() / num_response_tokens
 
         metrics = {
             "pg_loss": pg_loss.item(),
-            "ratio_mean": ratio.mean().item(),
-            "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6)
-            .float()
-            .mean()
-            .item(),
+            "ratio_mean": (ratio * response_mask).sum().item() / num_response_tokens.item(),
+            "ratio_clipped_frac": (
+                (torch.abs(ratio - clipped_ratio) > 1e-6) & response_mask.bool()
+            ).float().sum().item() / num_response_tokens.item(),
         }
         return pg_loss, metrics
 
@@ -187,73 +180,57 @@ class Batcher(Configurable):
         self.microbatch_size = config.microbatch_size
         self.max_seq_length = config.max_seq_length
 
-    def batch(self, episodes: list[Episode]) -> list[TrainBatch]:
+    def batch(self, episodes: list[Episode]) -> Iterator[TrainBatch]:
         """Pack episodes into [microbatch_size, max_seq_length] TrainBatches.
 
-        Calls pack() to produce [1, L] packed rows, stacks microbatch_size
-        of them into one TrainBatch per microbatch. Returns a list for
-        gradient accumulation.
+        Yields one TrainBatch per microbatch for gradient accumulation.
+        Each TrainBatch has token_ids [B, L] where B = microbatch_size.
         """
 
-        def _episode_samples() -> Iterator[dict[str, list]]:
+        def _episode_samples() -> Iterator[dict]:
             for ep in episodes:
-                yield {"input_ids": ep.prompt_token_ids + ep.token_ids}
+                prompt_len = len(ep.prompt_token_ids)
+                response_len = len(ep.token_ids)
+                yield {
+                    "input_ids": ep.prompt_token_ids + ep.token_ids,
+                    "ref_logprobs": [0.0] * prompt_len + ep.token_logprobs,
+                    "response_mask": [0.0] * prompt_len + [1.0] * response_len,
+                    "advantages": [0.0] * prompt_len + [ep.advantage] * response_len,
+                }
 
-        pack_gen = pack(
+        token_keys = ["input_ids", "ref_logprobs", "response_mask", "advantages"]
+        packed_generator = pack(
             _episode_samples(),
+            token_keys=token_keys,
             max_seq_length=self.max_seq_length,
-            pad_values={"input_ids": 0},
+            pad_values={
+                "input_ids": 0,
+                "ref_logprobs": 0.0,
+                "response_mask": 0.0,
+                "advantages": 0.0,
+            },
         )
 
-        # Collect packed [1, L] rows with their episode metadata
-        rows: list[dict] = []
-        row_episodes: list[list[Episode]] = []
-        ep_idx = 0
-        for packed in pack_gen:
-            segment_ids = packed["segment_ids"][0]
-            num_samples = segment_ids.max().item() + 1
-            group = episodes[ep_idx : ep_idx + num_samples]
-            ep_idx += num_samples
-            rows.append(packed)
-            row_episodes.append(group)
+        row_buffer: list[dict] = []
+        for packed_row in packed_generator:
+            row_buffer.append(packed_row)
+            if len(row_buffer) == self.microbatch_size:
+                yield self._to_train_batch(row_buffer)
+                row_buffer = []
 
-        # Stack microbatch_size rows into [B, L] TrainBatches
-        train_batches: list[TrainBatch] = []
-        for i in range(0, len(rows), self.microbatch_size):
-            chunk_rows = rows[i : i + self.microbatch_size]
-            chunk_eps = row_episodes[i : i + self.microbatch_size]
+        if row_buffer:
+            yield self._to_train_batch(row_buffer)
 
-            token_ids = torch.cat([r["input_ids"] for r in chunk_rows])
-            all_prompt_lens = [
-                len(ep.prompt_token_ids) for group in chunk_eps for ep in group
-            ]
-            all_response_lens = [
-                len(ep.token_ids) for group in chunk_eps for ep in group
-            ]
-            all_advantages = [
-                ep.advantage for group in chunk_eps for ep in group
-            ]
-            all_logprobs = [
-                ep.token_logprobs for group in chunk_eps for ep in group
-            ]
-
-            train_batches.append(
-                TrainBatch(
-                    token_ids=token_ids,
-                    prompt_lens=all_prompt_lens,
-                    response_lens=all_response_lens,
-                    seq_lens=[
-                        p + r
-                        for p, r in zip(all_prompt_lens, all_response_lens)
-                    ],
-                    advantages=torch.tensor(
-                        all_advantages, dtype=torch.float32
-                    ),
-                    token_logprobs=all_logprobs,
-                )
-            )
-
-        return train_batches
+    @staticmethod
+    def _to_train_batch(rows: list[dict]) -> TrainBatch:
+        """Stack packed rows into a single [B, L] TrainBatch."""
+        return TrainBatch(
+            token_ids=torch.cat([r["input_ids"] for r in rows]),
+            positions=torch.cat([r["positions"] for r in rows]),
+            ref_logprobs=torch.cat([r["ref_logprobs"] for r in rows]),
+            response_mask=torch.cat([r["response_mask"] for r in rows]),
+            advantages=torch.cat([r["advantages"] for r in rows]),
+        )
 
 
 class RLTrainer(Configurable):
@@ -386,18 +363,6 @@ class RLTrainer(Configurable):
             * p.pipeline_parallel_degree
             * p.context_parallel_degree
         )
-
-    def _shard_train_batches(
-        self, train_batches: list[TrainBatch]
-    ) -> list[list[TrainBatch]]:
-        """Round-robin partition TrainBatches across DP ranks."""
-        return [
-            [
-                train_batches[i]
-                for i in range(rank, len(train_batches), self.trainer_dp_degree)
-            ]
-            for rank in range(self.trainer_dp_degree)
-        ]
 
     async def setup(
         self,
@@ -646,14 +611,24 @@ class RLTrainer(Configurable):
                 _log_samples(episodes)
 
             # --- Pack and train --- #
-            # Batcher packs episodes into [microbatch_size, L] TrainBatches.
-            # Each TrainBatch is one gradient accumulation step.
-            microbatches = self._batcher.batch(episodes)
+            # Pack all episodes first, then shard packed microbatches
+            # across DP ranks via round-robin. Pad short ranks with dummy.
+            all_microbatches = list(self._batcher.batch(episodes))
+            dp = self.trainer_dp_degree
+            per_rank = [all_microbatches[i::dp] for i in range(dp)]
+            gradient_accumulation_steps = max(len(r) for r in per_rank)
+            dummy = TrainBatch.zeros_like(all_microbatches[0])
 
             all_fwd_bwd_metrics = []
-            for mb in microbatches:
+            for mb_idx in range(gradient_accumulation_steps):
+                batches = [
+                    per_rank[rank][mb_idx]
+                    if mb_idx < len(per_rank[rank])
+                    else dummy
+                    for rank in range(dp)
+                ]
                 fwd_bwd_metrics = self._get_rank_0_value(
-                    self.trainer.forward_backward.call([mb]).get()
+                    self.trainer.forward_backward.call(batches).get()
                 )
                 all_fwd_bwd_metrics.append(fwd_bwd_metrics)
             optim_metrics = self._get_rank_0_value(self.trainer.optim_step.call().get())

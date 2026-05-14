@@ -34,7 +34,6 @@ from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.actors.utils import (
     compute_logprobs,
-    extract_response_logprobs,
     verify_logprob_identity,
 )
 from torchtitan.experiments.rl.types import TrainBatch
@@ -275,83 +274,64 @@ class PolicyTrainer(Actor, Configurable):
         device = self.device
 
         token_ids = local_batch.token_ids.to(device)  # [B, L]
-        seq_lens = local_batch.seq_lens
-        prompt_lens = local_batch.prompt_lens
-        response_lens = local_batch.response_lens
-        advantages = local_batch.advantages.to(device)
+        positions = local_batch.positions.to(device)  # [B, L]
+        ref_logprobs = local_batch.ref_logprobs.to(device)  # [B, L]
+        response_mask = local_batch.response_mask.to(device)  # [B, L]
+        advantages = local_batch.advantages.to(device)  # [B, L]
 
-        max_seq_len = max(seq_lens)
+        B, L = token_ids.shape
         rope_cache_len = self.model.freqs_cis.shape[0]
-        if max_seq_len > rope_cache_len:
+        if L > rope_cache_len:
             raise ValueError(
-                f"Episode length {max_seq_len} exceeds rope cache size "
+                f"Sequence length {L} exceeds rope cache size "
                 f"{rope_cache_len}. Increase model max_seq_len or reduce "
                 f"generation max_tokens."
             )
-
-        # Build [B, L] positions from token_ids shape — detect document
-        # boundaries via create_varlen_metadata_for_document which scans
-        # for position resets. For [B, L] with padding, positions are
-        # built per row from seq_lens.
-        B, L = token_ids.shape
-        positions = torch.zeros(B, L, dtype=torch.long, device=device)
-        sample_idx = 0
-        for b in range(B):
-            col = 0
-            while sample_idx < len(seq_lens) and col + seq_lens[sample_idx] <= L:
-                sl = seq_lens[sample_idx]
-                positions[b, col : col + sl] = torch.arange(sl, device=device)
-                col += sl
-                sample_idx += 1
 
         attention_masks = create_varlen_metadata_for_document(positions)
 
         logits = self.model(
             token_ids, attention_masks=attention_masks, positions=positions
         )
+        policy_logprobs = compute_logprobs(logits, token_ids)  # [B, L-1]
 
-        # Flatten [B, L] → [1, B*L] for extract_response_logprobs which
-        # expects flat varlen indexing.
-        flat_token_ids = token_ids.reshape(1, -1)
-        all_policy_logprobs = compute_logprobs(
-            logits.reshape(1, B * L, -1), flat_token_ids
-        )
-        policy_logprobs = extract_response_logprobs(
-            all_policy_logprobs, seq_lens, prompt_lens, response_lens
-        )
+        # Align response_mask, advantages, ref_logprobs with shifted logprobs
+        response_mask = response_mask[:, 1:]  # [B, L-1]
+        advantages = advantages[:, 1:]  # [B, L-1]
+        ref_logprobs = ref_logprobs[:, 1:]  # [B, L-1]
 
         loss, loss_metrics = self.loss_fn(
             policy_logprobs=policy_logprobs,
+            response_mask=response_mask,
             advantages=advantages,
         )
 
-        verification_result = verify_logprob_identity(
-            local_batch.token_logprobs,
-            policy_logprobs,
+        verification = verify_logprob_identity(
+            policy_logprobs, ref_logprobs, response_mask
         )
 
         logger.debug(
-            f"Logprob verification: bitwise_identical={verification_result['logprob_bitwise_identical']}, "
-            f"max_delta={verification_result['logprob_max_delta']:.6e}, "
-            f"diff_mean={verification_result['logprob_diff_mean']:.6e}, "
-            f"diff_max={verification_result['logprob_diff_max']:.6e}, "
-            f"tokens_checked={verification_result['total_tokens_checked']}"
+            f"Logprob verification: "
+            f"bitwise_identical={verification['logprob_bitwise_identical']}, "
+            f"max_delta={verification['logprob_max_delta']:.6e}, "
+            f"diff_mean={verification['logprob_diff_mean']:.6e}, "
+            f"diff_max={verification['logprob_diff_max']:.6e}, "
+            f"tokens_checked={verification['total_tokens_checked']}"
         )
 
         # Backward pass
+        num_response_tokens = response_mask.sum().item()
         self.optimizers.zero_grad()
         loss.backward()
 
         return {
             "loss": loss.item(),
-            "advantage_mean": advantages.mean().item(),
-            "advantage_std": advantages.std().item(),
-            "logprob_diff_mean": verification_result["logprob_diff_mean"],
-            "logprob_diff_max": verification_result["logprob_diff_max"],
-            "logprob_max_delta": verification_result["logprob_max_delta"],
-            "logprob_bitwise_identical": verification_result[
-                "logprob_bitwise_identical"
-            ],
+            "advantage_mean": (advantages * response_mask).sum().item()
+            / max(num_response_tokens, 1),
+            "advantage_std": advantages[response_mask.bool()].std().item()
+            if num_response_tokens > 0
+            else 0.0,
+            **verification,
             **loss_metrics,
         }
 

@@ -9,11 +9,9 @@ from collections.abc import Iterable, Iterator
 import torch
 
 
-_PAD_SEGMENT_ID = -1
-
-
 def pack(
     samples: Iterable[dict[str, list]],
+    token_keys: list[str],
     max_seq_length: int,
     pad_values: dict[str, int | float],
 ) -> Iterator[dict[str, torch.Tensor]]:
@@ -23,57 +21,53 @@ def pack(
     sample doesn't fit, pads and yields the current buffer, then starts a
     new one with that sample. Yields remaining buffer at the end.
 
-    This is a generator — it yields one packed dict each time the buffer
-    is full. Same streaming behavior as SFT's _iter_greedy_packed.
-
     Args:
         samples: Iterable of dicts. Each dict maps field names to lists of
-            the same length. E.g. {"input_ids": [1,2,3], "label_ids": [2,3,4]}.
+            the same length. E.g. {"input_ids": [1,2,3], "loss_mask": [0,0,1]}.
+        token_keys: Which fields to pack (concat + pad). Must all have the
+            same length within a sample. The first key determines sample length.
         max_seq_length: Maximum tokens per packed sequence.
-        pad_values: Pad value for each field key.
+        pad_values: Pad value for each token_keys field.
 
     Yields:
-        Dict with field tensors [1, max_seq_length] and
-        "segment_ids" tensor [1, max_seq_length].
+        Dict with:
+        - Token field tensors [1, max_seq_length] for each key in token_keys
+        - "positions" tensor [1, max_seq_length] with per-document resets
+        - "seq_lens" list[int] — length of each sample in this row
     """
-    field_keys: list[str] | None = None
-    buffer: dict[str, list] = {}
-    buffer_segment_ids: list[int] = []
+    buffer: dict[str, list] = {key: [] for key in token_keys}
+    position_buffer: list[int] = []
+    seq_lens_buffer: list[int] = []
     buffer_length = 0
-    segment_id = 0
 
-    def _flush() -> dict[str, torch.Tensor]:
-        nonlocal buffer, buffer_segment_ids, buffer_length, segment_id
-        assert field_keys is not None
+    def _flush() -> dict:
+        nonlocal buffer, position_buffer, seq_lens_buffer, buffer_length
         pad_length = max_seq_length - buffer_length
         if pad_length > 0:
-            for key in field_keys:
+            for key in token_keys:
                 buffer[key].extend([pad_values[key]] * pad_length)
-            buffer_segment_ids.extend([_PAD_SEGMENT_ID] * pad_length)
+            position_buffer.extend(range(pad_length))
 
-        result = {
+        result: dict = {
             key: torch.tensor(
-                values, dtype=torch.long if key.endswith("_ids") else torch.float32
+                buffer[key],
+                dtype=torch.long if key.endswith("_ids") else torch.float32,
             ).unsqueeze(0)
-            for key, values in buffer.items()
+            for key in token_keys
         }
-        result["segment_ids"] = torch.tensor(
-            buffer_segment_ids, dtype=torch.long
+        result["positions"] = torch.tensor(
+            position_buffer, dtype=torch.long
         ).unsqueeze(0)
+        result["seq_lens"] = list(seq_lens_buffer)
 
-        buffer = {key: [] for key in field_keys}
-        buffer_segment_ids = []
+        buffer = {key: [] for key in token_keys}
+        position_buffer = []
+        seq_lens_buffer = []
         buffer_length = 0
-        segment_id = 0
         return result
 
     for sample in samples:
-        if field_keys is None:
-            field_keys = list(sample.keys())
-            buffer = {key: [] for key in field_keys}
-
-        first_key = field_keys[0]
-        sample_length = len(sample[first_key])
+        sample_length = len(sample[token_keys[0]])
 
         if sample_length > max_seq_length:
             continue
@@ -81,11 +75,11 @@ def pack(
         if buffer_length > 0 and buffer_length + sample_length > max_seq_length:
             yield _flush()
 
-        for key in field_keys:
+        for key in token_keys:
             buffer[key].extend(sample[key])
-        buffer_segment_ids.extend([segment_id] * sample_length)
+        position_buffer.extend(range(sample_length))
+        seq_lens_buffer.append(sample_length)
         buffer_length += sample_length
-        segment_id += 1
 
     if buffer_length > 0:
         yield _flush()

@@ -48,67 +48,41 @@ def extract_response_logprobs(
 
 
 def verify_logprob_identity(
-    vllm_token_log_probs: list[list[float]],
-    batch_token_log_probs: list[torch.Tensor],
+    policy_logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
 ) -> dict:
-    """
-    Check if vLLM log probs and computed log probs are bit-wise identical,
-    and compute the log ratio (train/generator) between them.
+    """Compare trainer logprobs against generator ref_logprobs on response tokens.
 
-    Args:
-        vllm_token_log_probs: Per-token log probs from vLLM (generator)
-        batch_token_log_probs: Per-token log probs computed by the trainer model
+    All inputs are [B, L] tensors. Only positions where response_mask == 1
+    are compared.
 
     Returns:
-        Verification result dict with identity status, delta info, and log ratio stats
+        Dict with bitwise_identical, max_delta, diff_mean, diff_max, tokens_checked.
     """
-    result = {
-        "logprob_bitwise_identical": True,
-        "num_samples_checked": len(vllm_token_log_probs),
-        "total_tokens_checked": 0,
-        "num_tokens_different": 0,
-        "logprob_max_delta": 0.0,
-        "avg_delta": 0.0,
-        "logprob_diff_mean": 0.0,
-        "logprob_diff_max": 0.0,
+    mask = response_mask.bool()
+    num_tokens = mask.sum().item()
+
+    if num_tokens == 0:
+        return {
+            "logprob_bitwise_identical": True,
+            "logprob_max_delta": 0.0,
+            "logprob_diff_mean": 0.0,
+            "logprob_diff_max": 0.0,
+            "total_tokens_checked": 0,
+        }
+
+    policy_response = policy_logprobs[mask]
+    ref_response = ref_logprobs[mask]
+
+    bitwise_identical = torch.equal(policy_response, ref_response)
+    deltas = (policy_response - ref_response).abs()
+    log_ratio = policy_response - ref_response
+
+    return {
+        "logprob_bitwise_identical": bitwise_identical,
+        "logprob_max_delta": deltas.max().item(),
+        "logprob_diff_mean": log_ratio.mean().item(),
+        "logprob_diff_max": log_ratio.abs().max().item(),
+        "total_tokens_checked": int(num_tokens),
     }
-
-    all_deltas = []
-    all_log_ratios = []
-
-    for vllm_lps, titan_lps in zip(vllm_token_log_probs, batch_token_log_probs):
-        # Convert vLLM log probs to tensor
-        vllm_tensor = torch.tensor(vllm_lps, dtype=torch.float32)
-        # Convert titan log probs to float32 for comparison
-        titan_tensor = titan_lps.detach().cpu().float()
-
-        num_tokens = len(vllm_lps)
-        result["total_tokens_checked"] += num_tokens
-
-        # Check bitwise identity
-        bitwise_match = torch.equal(vllm_tensor, titan_tensor)
-
-        if not bitwise_match:
-            result["logprob_bitwise_identical"] = False
-            num_different = (vllm_tensor != titan_tensor).sum().item()
-            result["num_tokens_different"] += num_different
-            deltas = (vllm_tensor - titan_tensor).abs()
-            all_deltas.append(deltas)
-
-        # Log ratio: log(pi_train / pi_generator) = logprob_train - logprob_generator
-        # Should be 0 when weights are identical (ratio = 1)
-        all_log_ratios.append(titan_tensor - vllm_tensor)
-
-    # Compute aggregate delta stats
-    if all_deltas:
-        combined_deltas = torch.cat(all_deltas)
-        result["logprob_max_delta"] = combined_deltas.max().item()
-        result["avg_delta"] = combined_deltas.mean().item()
-
-    # Compute log ratio stats
-    if all_log_ratios:
-        combined_log_ratios = torch.cat(all_log_ratios)
-        result["logprob_diff_mean"] = combined_log_ratios.mean().item()
-        result["logprob_diff_max"] = combined_log_ratios.abs().max().item()
-
-    return result

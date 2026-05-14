@@ -407,8 +407,8 @@ class ChatDataset(IterableDataset, Stateful):
 
         return input_ids, label_ids
 
-    def __iter__(self):
-        """Yield individual tokenized samples. Packing is done by PackCollator."""
+    def _tokenized_samples(self):
+        """Yield tokenized samples as dicts for pack()."""
         while True:
             for sample in self._get_data_iter():
                 # pyrefly: ignore [bad-argument-type]
@@ -416,12 +416,13 @@ class ChatDataset(IterableDataset, Stateful):
                 self._sample_idx += 1
                 if result is None:
                     continue
-
                 input_ids, label_ids = result
                 yield {"input_ids": input_ids, "label_ids": label_ids}
 
             if not self.infinite:
-                logger.warning(f"Chat dataset '{self._dataset_id}' has run out of data")
+                logger.warning(
+                    f"Chat dataset '{self._dataset_id}' has run out of data"
+                )
                 break
             else:
                 self._sample_idx = 0
@@ -438,6 +439,20 @@ class ChatDataset(IterableDataset, Stateful):
                     f"(epoch {self._epoch})"
                 )
 
+    def __iter__(self):
+        """Yield packed (input_dict, labels) using shared pack()."""
+        token_keys = ["input_ids", "label_ids"]
+        for packed in pack(
+            self._tokenized_samples(),
+            token_keys=token_keys,
+            max_seq_length=self.seq_len,
+            pad_values={"input_ids": self._eos_id, "label_ids": IGNORE_INDEX},
+        ):
+            yield (
+                {"input": packed["input_ids"][0], "positions": packed["positions"][0]},
+                packed["label_ids"][0],
+            )
+
     def state_dict(self):
         _state_dict: dict[str, Any] = {
             "epoch": self._epoch,
@@ -453,14 +468,6 @@ class ChatDataset(IterableDataset, Stateful):
     def load_state_dict(self, state_dict):
         self._epoch = state_dict["epoch"]
 
-        if "inputs_buffer" in state_dict:
-            logger.warning(
-                "Checkpoint contains old packing buffer state "
-                "(inputs_buffer, pending_input_ids, etc.) which is no longer "
-                "used. Packing is now handled by PackCollator. A few in-flight "
-                "samples from the old buffer may be skipped on resume."
-            )
-
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
             if self._epoch > 0:
@@ -475,63 +482,8 @@ class ChatDataset(IterableDataset, Stateful):
             self._data.load_state_dict(data_state)
 
 
-class PackCollator:
-    """Collate function that packs individual samples via pack().
-
-    Receives batch_size individual samples from the DataLoader, feeds them
-    to the shared pack() generator which greedy-packs into [1, seq_len]
-    sequences. Stacks all packed sequences into [batch_size, seq_len].
-    """
-
-    def __init__(self, seq_len: int, pad_id: int):
-        self._seq_len = seq_len
-        self._pad_values: dict[str, int | float] = {
-            "input_ids": pad_id,
-            "label_ids": IGNORE_INDEX,
-        }
-
-    def __call__(
-        self, samples: list[dict[str, list[int]]]
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        packed_list = list(
-            pack(
-                samples,
-                max_seq_length=self._seq_len,
-                pad_values=self._pad_values,
-            )
-        )
-
-        # Stack [1, L] packed sequences into [num_packed, L]
-        input_ids = torch.cat([p["input_ids"] for p in packed_list])
-        label_ids = torch.cat([p["label_ids"] for p in packed_list])
-        segment_ids = torch.cat([p["segment_ids"] for p in packed_list])
-
-        # Derive positions from segment_ids
-        B, L = segment_ids.shape
-        positions = torch.zeros_like(segment_ids)
-        for b in range(B):
-            pos = 0
-            prev_segment = segment_ids[b, 0].item()
-            for t in range(L):
-                cur_segment = segment_ids[b, t].item()
-                if cur_segment != prev_segment:
-                    pos = 0
-                    prev_segment = cur_segment
-                positions[b, t] = pos
-                pos += 1
-
-        return (
-            {"input": input_ids, "positions": positions},
-            label_ids,
-        )
-
-
 class ChatDataLoader(ParallelAwareDataloader):
-    """Chat dataloader for instruction/conversation datasets.
-
-    Uses PackCollator to bin-pack individual samples from ChatDataset
-    into [batch_size, seq_len] tensors via the shared pack() function.
-    """
+    """Chat dataloader for instruction/conversation datasets."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(ParallelAwareDataloader.Config):
@@ -576,16 +528,12 @@ class ChatDataLoader(ParallelAwareDataloader):
             infinite=config.infinite,
         )
 
-        assert tokenizer.eos_id is not None, "Tokenizer must have an eos_id"
-        collate_fn = PackCollator(seq_len=seq_len, pad_id=tokenizer.eos_id)
-
         dataloader_kwargs = {
             "num_workers": config.num_workers,
             "persistent_workers": config.persistent_workers,
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
             "batch_size": local_batch_size,
-            "collate_fn": collate_fn,
         }
 
         super().__init__(
