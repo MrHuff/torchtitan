@@ -456,8 +456,8 @@ class HFTransformerModel(BaseModel):
             # Attach FlexAttention kernel module to each attention layer
             # so apply_cp_to_forward can find and wrap it for CP.
             if hasattr(layer, "self_attn") and config.attn_implementation == "flex_torchtitan":
-                layer.self_attn._flex_kernel = HFFlexAttention(
-                    config=HFFlexAttention.Config()
+                layer.self_attn.register_module(
+                    "_flex_kernel", HFFlexAttention(config=HFFlexAttention.Config())
                 )
 
     def set_cp_mesh(self, mesh):
