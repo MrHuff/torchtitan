@@ -90,14 +90,3 @@ class TrainBatch:
     ref_logprobs: torch.Tensor  # [B, L] — 0.0 for prompt/padding
     response_mask: torch.Tensor  # [B, L] — 1.0 for response, 0.0 for prompt/padding
     advantages: torch.Tensor  # [B, L] — per-token, 0.0 for prompt/padding
-
-    @staticmethod
-    def zeros_like(other: "TrainBatch") -> "TrainBatch":
-        """Create a dummy batch with same shape but all zeros (no gradient contribution)."""
-        return TrainBatch(
-            token_ids=torch.zeros_like(other.token_ids),
-            positions=torch.zeros_like(other.positions),
-            ref_logprobs=torch.zeros_like(other.ref_logprobs),
-            response_mask=torch.zeros_like(other.response_mask),
-            advantages=torch.zeros_like(other.advantages),
-        )

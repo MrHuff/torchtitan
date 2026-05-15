@@ -27,26 +27,6 @@ def compute_logprobs(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Ten
     return logprobs.gather(2, shift_targets.unsqueeze(-1)).squeeze(-1)
 
 
-def extract_response_logprobs(
-    packed_logprobs: torch.Tensor,
-    seq_lens: list[int],
-    prompt_lens: list[int],
-    response_lens: list[int],
-) -> list[torch.Tensor]:
-    """Extract per-sample response logprobs from packed logprobs."""
-    seq_start = 0
-    result = []
-    for i in range(len(seq_lens)):
-        # Logprobs are shifted: position j holds logprob of token j+1,
-        # so response start (seq_start + prompt_len) maps to index
-        # (seq_start + prompt_len - 1) in the logprobs tensor.
-        s = seq_start + prompt_lens[i] - 1
-        e = s + response_lens[i]
-        result.append(packed_logprobs[0, s:e])
-        seq_start += seq_lens[i]
-    return result
-
-
 def verify_logprob_identity(
     policy_logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor,

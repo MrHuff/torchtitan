@@ -409,23 +409,23 @@ class ChatDataset(IterableDataset, Stateful):
 
     def _tokenized_samples(self):
         """Yield tokenized samples as dicts for pack()."""
+        self._skipped_samples = 0
         while True:
             for sample in self._get_data_iter():
                 # pyrefly: ignore [bad-argument-type]
                 result = self._tokenize_sample(sample)
-                self._sample_idx += 1
                 if result is None:
+                    self._skipped_samples += 1
                     continue
                 input_ids, label_ids = result
                 yield {"input_ids": input_ids, "label_ids": label_ids}
 
             if not self.infinite:
-                logger.warning(
-                    f"Chat dataset '{self._dataset_id}' has run out of data"
-                )
+                logger.warning(f"Chat dataset '{self._dataset_id}' has run out of data")
                 break
             else:
                 self._sample_idx = 0
+                self._skipped_samples = 0
                 self._epoch += 1
                 if isinstance(self._data, Dataset):
                     self._data = cast(
@@ -448,6 +448,9 @@ class ChatDataset(IterableDataset, Stateful):
             max_seq_length=self.seq_len,
             pad_values={"input_ids": self._eos_id, "label_ids": IGNORE_INDEX},
         ):
+            n = len(packed["seq_lens"])
+            self._sample_idx += n + self._skipped_samples
+            self._skipped_samples = 0
             yield (
                 {"input": packed["input_ids"][0], "positions": packed["positions"][0]},
                 packed["label_ids"][0],

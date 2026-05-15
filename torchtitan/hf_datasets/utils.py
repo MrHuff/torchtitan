@@ -55,9 +55,9 @@ def pack(
             ).unsqueeze(0)
             for key in token_keys
         }
-        result["positions"] = torch.tensor(
-            position_buffer, dtype=torch.long
-        ).unsqueeze(0)
+        result["positions"] = torch.tensor(position_buffer, dtype=torch.long).unsqueeze(
+            0
+        )
         result["seq_lens"] = list(seq_lens_buffer)
 
         buffer = {key: [] for key in token_keys}

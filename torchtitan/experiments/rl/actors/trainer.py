@@ -256,11 +256,19 @@ class PolicyTrainer(Actor, Configurable):
         return model
 
     @endpoint
-    async def forward_backward(self, train_data: list[TrainBatch]) -> dict:
+    async def forward_backward(
+        self,
+        train_data: list[TrainBatch],
+        global_valid_tokens: int,
+    ) -> dict:
         """Run forward pass, compute loss, and call backward.
 
         Args:
             train_data: List of batches, one per DP rank.
+            global_valid_tokens: Total response tokens across the global batch
+                (sum over all DP ranks and gradient accumulation steps). Used
+                by the loss as the normalizing denominator so per-rank loss
+                contributions sum to the correct global mean.
 
         Returns:
             dict with loss metrics, advantage stats, and logprob verification.
@@ -304,6 +312,7 @@ class PolicyTrainer(Actor, Configurable):
             policy_logprobs=policy_logprobs,
             response_mask=response_mask,
             advantages=advantages,
+            global_valid_tokens=global_valid_tokens,
         )
 
         verification = verify_logprob_identity(

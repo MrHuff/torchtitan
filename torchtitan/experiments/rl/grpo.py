@@ -74,7 +74,16 @@ class GRPOLoss(Configurable):
         policy_logprobs: torch.Tensor,
         response_mask: torch.Tensor,
         advantages: torch.Tensor,
+        global_valid_tokens: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Per-token GRPO clipped surrogate, summed locally and normalized by the
+        global response-token count.
+
+        Each DP rank contributes ``local_sum / global_valid_tokens``; the per-rank
+        losses sum to the correct global mean, matching the SFT trainer's pattern
+        (``torchtitan/trainer.py`` ~line 720). Using the local count here would
+        bias gradient accumulation across uneven ranks.
+        """
         # Per-token log ratio (masked to response tokens only)
         ratio = torch.exp(policy_logprobs * response_mask)
 
@@ -82,15 +91,24 @@ class GRPOLoss(Configurable):
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
         clipped_loss = clipped_ratio * advantages
 
-        num_response_tokens = response_mask.sum().clamp(min=1)
-        pg_loss = -(torch.min(unclipped_loss, clipped_loss) * response_mask).sum() / num_response_tokens
+        denom = max(global_valid_tokens, 1)
+        pg_loss = (
+            -(torch.min(unclipped_loss, clipped_loss) * response_mask).sum() / denom
+        )
 
+        # Local diagnostics — use local count to avoid divide-by-zero on
+        # all-pad ranks and to keep these per-rank-meaningful.
+        local_count = max(int(response_mask.sum().item()), 1)
         metrics = {
             "pg_loss": pg_loss.item(),
-            "ratio_mean": (ratio * response_mask).sum().item() / num_response_tokens.item(),
+            "ratio_mean": (ratio * response_mask).sum().item() / local_count,
             "ratio_clipped_frac": (
                 (torch.abs(ratio - clipped_ratio) > 1e-6) & response_mask.bool()
-            ).float().sum().item() / num_response_tokens.item(),
+            )
+            .float()
+            .sum()
+            .item()
+            / local_count,
         }
         return pg_loss, metrics
 
@@ -160,32 +178,114 @@ def _log_samples(items: list[Episode] | list[Completion]) -> None:
 
 
 class Batcher(Configurable):
-    """Packs variable-length samples into [microbatch_size, max_seq_length] microbatches.
+    """Packs episodes into a global batch split across DP ranks and grad accum steps.
 
-    Wraps the shared pack() generator: calls it to produce [1, L] packed
-    sequences, collects microbatch_size of them, and stacks into [B, L].
-    Each stacked microbatch becomes a list[TrainBatch] (one per row) for
-    distribution across DP ranks.
+    Follows the TorchTitan SFT trainer convention: the user configures
+    ``local_batch_size`` (per-DP-rank batch size) and ``global_batch_size``
+    (total packed rows per optimizer step). The number of gradient
+    accumulation steps is derived as
+    ``global_batch_size // (local_batch_size * dp_degree)``.
+
+    If the episodes yield fewer packed rows than ``global_batch_size``, the
+    batch is padded with zero-``response_mask`` rows that contribute 0 to
+    ``global_valid_tokens`` and therefore 0 to the loss — no dummy
+    ``TrainBatch`` patching at the consumer side.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        microbatch_size: int = 1
-        """Number of packed rows per microbatch."""
+        local_batch_size: int = 1
+        """Per-DP-rank batch size (packed rows per forward pass)."""
 
-        max_seq_length: int = 2048
-        """Maximum tokens per packed row."""
+        global_batch_size: int = -1
+        """Total packed rows per optimizer step (across all DP ranks and
+        gradient accumulation steps). When ``-1`` (default), the Batcher
+        auto-sizes to fit all episodes by rounding the packed-row count up
+        to the next multiple of ``local_batch_size * dp_degree``. When set
+        explicitly, must be a multiple of ``local_batch_size * dp_degree``;
+        episode-rich steps are truncated with a warning."""
+
+        seq_length: int = 2048
+        """Tokens per packed row. Must not exceed the model's intrinsic
+        ``rope.max_seq_len`` — validated in ``ModelArgs.update_from_config``."""
+
+        input_ids_pad_value: int = 0
+        """Token id used to pad packed sequences. Any in-vocab id is safe; these
+        positions have ``response_mask == 0`` and contribute 0 to the loss.
+        NOTE: -100 (IGNORE_INDEX_CE) is invalid here — ``input_ids`` are
+        embedded by the model, so the value must be a valid token id."""
 
     def __init__(self, config: Config):
-        self.microbatch_size = config.microbatch_size
-        self.max_seq_length = config.max_seq_length
+        self.local_batch_size = config.local_batch_size
+        self.global_batch_size = config.global_batch_size
+        self.seq_length = config.seq_length
+        self.input_ids_pad_value = config.input_ids_pad_value
 
-    def batch(self, episodes: list[Episode]) -> Iterator[TrainBatch]:
-        """Pack episodes into [microbatch_size, max_seq_length] TrainBatches.
+    def batch(
+        self,
+        episodes: list[Episode],
+        *,
+        dp_degree: int,
+    ) -> tuple[list[list[TrainBatch]], int]:
+        """Pack episodes into a structured global batch.
 
-        Yields one TrainBatch per microbatch for gradient accumulation.
-        Each TrainBatch has token_ids [B, L] where B = microbatch_size.
+        Returns:
+            per_step_batches: shape ``[gradient_accumulation_steps][dp_degree]``,
+                each entry is a ``TrainBatch`` with ``local_batch_size`` rows.
+            global_valid_tokens: total response tokens across the global batch
+                (excludes padding rows). Use this to normalize the loss so that
+                gradient accumulation matches a single large-batch step.
         """
+        chunk = self.local_batch_size * dp_degree
+        packed_rows = list(self._pack_episodes(episodes))
+
+        if self.global_batch_size < 0:
+            # Auto-size: round packed-row count up to next multiple of chunk,
+            # preserving the original "use all episodes" behavior.
+            global_batch_size = max(
+                ((len(packed_rows) + chunk - 1) // chunk) * chunk, chunk
+            )
+        else:
+            global_batch_size = self.global_batch_size
+            assert global_batch_size > 0
+            assert global_batch_size % chunk == 0, (
+                f"global_batch_size ({global_batch_size}) must be a multiple of "
+                f"local_batch_size ({self.local_batch_size}) * dp_degree "
+                f"({dp_degree})"
+            )
+            if len(packed_rows) > global_batch_size:
+                logger.warning(
+                    f"Episodes packed into {len(packed_rows)} rows, exceeding "
+                    f"global_batch_size {global_batch_size}; truncating. "
+                    f"Consider increasing global_batch_size or reducing "
+                    f"num_prompts_per_step."
+                )
+                packed_rows = packed_rows[:global_batch_size]
+        gradient_accumulation_steps = global_batch_size // chunk
+
+        if len(packed_rows) < global_batch_size:
+            pad_count = global_batch_size - len(packed_rows)
+            packed_rows.extend(self._pad_row() for _ in range(pad_count))
+
+        global_valid_tokens = sum(
+            int(row["response_mask"].sum().item()) for row in packed_rows
+        )
+
+        # Split into [gradient_accumulation_steps][dp_degree] TrainBatches,
+        # each holding local_batch_size rows.
+        per_step_batches: list[list[TrainBatch]] = []
+        for step in range(gradient_accumulation_steps):
+            step_batches: list[TrainBatch] = []
+            for rank in range(dp_degree):
+                start = (step * dp_degree + rank) * self.local_batch_size
+                end = start + self.local_batch_size
+                step_batches.append(self.collate(packed_rows[start:end]))
+            per_step_batches.append(step_batches)
+
+        return per_step_batches, global_valid_tokens
+
+    def _pack_episodes(self, episodes: list[Episode]) -> Iterator[dict]:
+        """Pack episodes into [1, seq_length] rows via shared pack()."""
 
         def _episode_samples() -> Iterator[dict]:
             for ep in episodes:
@@ -199,30 +299,33 @@ class Batcher(Configurable):
                 }
 
         token_keys = ["input_ids", "ref_logprobs", "response_mask", "advantages"]
-        packed_generator = pack(
+        yield from pack(
             _episode_samples(),
             token_keys=token_keys,
-            max_seq_length=self.max_seq_length,
+            max_seq_length=self.seq_length,
             pad_values={
-                "input_ids": 0,
+                "input_ids": self.input_ids_pad_value,
                 "ref_logprobs": 0.0,
                 "response_mask": 0.0,
                 "advantages": 0.0,
             },
         )
 
-        row_buffer: list[dict] = []
-        for packed_row in packed_generator:
-            row_buffer.append(packed_row)
-            if len(row_buffer) == self.microbatch_size:
-                yield self._to_train_batch(row_buffer)
-                row_buffer = []
-
-        if row_buffer:
-            yield self._to_train_batch(row_buffer)
+    def _pad_row(self) -> dict:
+        """Construct a fully-padded row. response_mask is all zeros so this
+        contributes 0 to ``global_valid_tokens`` and 0 to the loss."""
+        L = self.seq_length
+        return {
+            "input_ids": torch.full((1, L), self.input_ids_pad_value, dtype=torch.long),
+            "ref_logprobs": torch.zeros((1, L), dtype=torch.float32),
+            "response_mask": torch.zeros((1, L), dtype=torch.float32),
+            "advantages": torch.zeros((1, L), dtype=torch.float32),
+            "positions": torch.arange(L, dtype=torch.long).unsqueeze(0),
+            "seq_lens": [],
+        }
 
     @staticmethod
-    def _to_train_batch(rows: list[dict]) -> TrainBatch:
+    def collate(rows: list[dict]) -> TrainBatch:
         """Stack packed rows into a single [B, L] TrainBatch."""
         return TrainBatch(
             token_ids=torch.cat([r["input_ids"] for r in rows]),
@@ -276,7 +379,7 @@ class RLTrainer(Configurable):
         """torch.compile config shared by trainer and generator."""
 
         batcher: Batcher.Config = field(default_factory=Batcher.Config)
-        """Batcher config for packing episodes into microbatches."""
+        """Batcher config: local_batch_size, global_batch_size, seq_length."""
 
         trainer: PolicyTrainer.Config = field(
             default_factory=lambda: PolicyTrainer.Config(loss=GRPOLoss.Config())
@@ -611,28 +714,27 @@ class RLTrainer(Configurable):
                 _log_samples(episodes)
 
             # --- Pack and train --- #
-            # Pack all episodes first, then shard packed microbatches
-            # across DP ranks via round-robin. Pad short ranks with dummy.
-            all_microbatches = list(self._batcher.batch(episodes))
-            dp = self.trainer_dp_degree
-            per_rank = [all_microbatches[i::dp] for i in range(dp)]
-            gradient_accumulation_steps = max(len(r) for r in per_rank)
-            dummy = TrainBatch.zeros_like(all_microbatches[0])
+            # Batcher produces a fixed global_batch_size of packed rows,
+            # padded as needed, and pre-split into [grad_accum_steps][dp_degree]
+            # local TrainBatches. global_valid_tokens excludes padding rows.
+            per_step_batches, global_valid_tokens = self._batcher.batch(
+                episodes, dp_degree=self.trainer_dp_degree
+            )
 
             all_fwd_bwd_metrics = []
-            for mb_idx in range(gradient_accumulation_steps):
-                batches = [
-                    per_rank[rank][mb_idx]
-                    if mb_idx < len(per_rank[rank])
-                    else dummy
-                    for rank in range(dp)
-                ]
+            for step_batches in per_step_batches:
                 fwd_bwd_metrics = self._get_rank_0_value(
-                    self.trainer.forward_backward.call(batches).get()
+                    self.trainer.forward_backward.call(
+                        step_batches, global_valid_tokens
+                    ).get()
                 )
                 all_fwd_bwd_metrics.append(fwd_bwd_metrics)
             optim_metrics = self._get_rank_0_value(self.trainer.optim_step.call().get())
-            metrics = {**all_fwd_bwd_metrics[-1], **optim_metrics}
+            metrics = {
+                **all_fwd_bwd_metrics[-1],
+                **optim_metrics,
+                "global_valid_tokens": global_valid_tokens,
+            }
 
             # --- Weight sync --- #
             t0 = time.perf_counter()
