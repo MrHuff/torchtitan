@@ -37,6 +37,8 @@ import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
+from torchtitan.components.dataloading.utils import pack
+
 from torchtitan.config import (
     CompileConfig,
     ConfigManager,
@@ -52,7 +54,6 @@ from torchtitan.experiments.rl.types import (
     TrainBatch,
     Trajectory,
 )
-from torchtitan.hf_datasets.utils import pack
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -180,16 +181,9 @@ def _log_samples(items: list[Episode] | list[Completion]) -> None:
 class Batcher(Configurable):
     """Packs episodes into a global batch split across DP ranks and grad accum steps.
 
-    Follows the TorchTitan SFT trainer convention: the user configures
-    ``local_batch_size`` (per-DP-rank batch size) and ``global_batch_size``
-    (total packed rows per optimizer step). The number of gradient
+    The number of gradient
     accumulation steps is derived as
     ``global_batch_size // (local_batch_size * dp_degree)``.
-
-    If the episodes yield fewer packed rows than ``global_batch_size``, the
-    batch is padded with zero-``response_mask`` rows that contribute 0 to
-    ``global_valid_tokens`` and therefore 0 to the loss — no dummy
-    ``TrainBatch`` patching at the consumer side.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -198,12 +192,9 @@ class Batcher(Configurable):
         """Per-DP-rank batch size (packed rows per forward pass)."""
 
         global_batch_size: int = -1
-        """Total packed rows per optimizer step (across all DP ranks and
-        gradient accumulation steps). When ``-1`` (default), the Batcher
-        auto-sizes to fit all episodes by rounding the packed-row count up
-        to the next multiple of ``local_batch_size * dp_degree``. When set
-        explicitly, must be a multiple of ``local_batch_size * dp_degree``;
-        episode-rich steps are truncated with a warning."""
+        """Total packed rows per optimizer step. ``-1`` (default) auto-sizes
+        to fit all episodes. When set explicitly, must be a multiple of
+        ``local_batch_size * dp_degree``; excess rows are truncated."""
 
         seq_length: int = 2048
         """Tokens per packed row. Must not exceed the model's intrinsic
@@ -211,9 +202,7 @@ class Batcher(Configurable):
 
         input_ids_pad_value: int = 0
         """Token id used to pad packed sequences. Any in-vocab id is safe; these
-        positions have ``response_mask == 0`` and contribute 0 to the loss.
-        NOTE: -100 (IGNORE_INDEX_CE) is invalid here — ``input_ids`` are
-        embedded by the model, so the value must be a valid token id."""
+        positions have ``response_mask == 0`` and contribute 0 to the loss."""
 
     def __init__(self, config: Config):
         self.local_batch_size = config.local_batch_size

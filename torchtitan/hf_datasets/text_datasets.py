@@ -17,10 +17,10 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
+from torchtitan.components.dataloading.utils import pack
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.hf_datasets import DatasetConfig
-from torchtitan.hf_datasets.utils import pack
 from torchtitan.tools.logging import logger
 
 
@@ -408,17 +408,39 @@ class ChatDataset(IterableDataset, Stateful):
         return input_ids, label_ids
 
     def _tokenized_samples(self):
-        """Yield tokenized samples as dicts for pack()."""
+        """Yield tokenized samples for a single pass over the data."""
+        for sample in self._get_data_iter():
+            # pyrefly: ignore [bad-argument-type]
+            result = self._tokenize_sample(sample)
+            if result is None:
+                self._skipped_samples += 1
+                continue
+            input_ids, label_ids = result
+            yield {"input_ids": input_ids, "label_ids": label_ids}
+
+    def __iter__(self):
+        """Yield packed (input_dict, labels) using shared pack()."""
+        token_keys = ["input_ids", "label_ids"]
+        pad_values = {"input_ids": self._eos_id, "label_ids": IGNORE_INDEX}
         self._skipped_samples = 0
+
         while True:
-            for sample in self._get_data_iter():
-                # pyrefly: ignore [bad-argument-type]
-                result = self._tokenize_sample(sample)
-                if result is None:
-                    self._skipped_samples += 1
-                    continue
-                input_ids, label_ids = result
-                yield {"input_ids": input_ids, "label_ids": label_ids}
+            for packed in pack(
+                self._tokenized_samples(),
+                token_keys=token_keys,
+                max_seq_length=self.seq_len,
+                pad_values=pad_values,
+            ):
+                n = len(packed["seq_lens"])
+                self._sample_idx += n + self._skipped_samples
+                self._skipped_samples = 0
+                yield (
+                    {
+                        "input": packed["input_ids"][0],
+                        "positions": packed["positions"][0],
+                    },
+                    packed["label_ids"][0],
+                )
 
             if not self.infinite:
                 logger.warning(f"Chat dataset '{self._dataset_id}' has run out of data")
@@ -438,23 +460,6 @@ class ChatDataset(IterableDataset, Stateful):
                     f"Chat dataset '{self._dataset_id}' is being re-looped "
                     f"(epoch {self._epoch})"
                 )
-
-    def __iter__(self):
-        """Yield packed (input_dict, labels) using shared pack()."""
-        token_keys = ["input_ids", "label_ids"]
-        for packed in pack(
-            self._tokenized_samples(),
-            token_keys=token_keys,
-            max_seq_length=self.seq_len,
-            pad_values={"input_ids": self._eos_id, "label_ids": IGNORE_INDEX},
-        ):
-            n = len(packed["seq_lens"])
-            self._sample_idx += n + self._skipped_samples
-            self._skipped_samples = 0
-            yield (
-                {"input": packed["input_ids"][0], "positions": packed["positions"][0]},
-                packed["label_ids"][0],
-            )
 
     def state_dict(self):
         _state_dict: dict[str, Any] = {
