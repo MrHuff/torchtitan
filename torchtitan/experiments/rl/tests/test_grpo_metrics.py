@@ -20,13 +20,13 @@ import pytest
 
 import torch
 
-from torchtitan.experiments.rl.grpo import _build_reward_metrics, GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.grpo import _prepare_reward_metrics, GRPOLoss, RLTrainer
 from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import Completion, Step, Trajectory
 
 
 # ---------------------------------------------------------------------------
-# _build_reward_metrics
+# _prepare_reward_metrics
 # ---------------------------------------------------------------------------
 
 
@@ -55,7 +55,7 @@ class TestBuildRewardMetrics:
             _reward_trajectory({"correctness": 1.0, "format": 0.5}, sample_idx=0),
             _reward_trajectory({"correctness": 0.0, "format": 1.0}, sample_idx=1),
         ]
-        metrics = _build_reward_metrics("reward/component", trajectories)
+        metrics = _prepare_reward_metrics("reward/component", trajectories)
         keys = {entry.key for entry in metrics}
         assert keys == {
             "reward/component/correctness",
@@ -71,17 +71,17 @@ class TestBuildRewardMetrics:
             _reward_trajectory({"correctness": 1.0}, sample_idx=0),
             _reward_trajectory({"format": 0.5}, sample_idx=1),
         ]
-        metrics = _build_reward_metrics("reward/component", trajectories)
+        metrics = _prepare_reward_metrics("reward/component", trajectories)
         agg = m.MetricsProcessor._aggregate_metrics(metrics)
         assert agg["reward/component/correctness/mean"] == 1.0
         assert agg["reward/component/format/mean"] == 0.5
 
     def test_empty_input(self) -> None:
-        assert _build_reward_metrics("reward/component", []) == []
+        assert _prepare_reward_metrics("reward/component", []) == []
 
     def test_prefix_controls_namespace(self) -> None:
         trajectories = [_reward_trajectory({"correctness": 1.0}, sample_idx=0)]
-        metrics = _build_reward_metrics("validation/reward/component", trajectories)
+        metrics = _prepare_reward_metrics("validation/reward/component", trajectories)
         assert metrics[0].key == "validation/reward/component/correctness"
 
 
@@ -138,14 +138,25 @@ def _build_collect_rollouts_inputs(self_obj):
 
     self_obj.config = MagicMock()
     self_obj.config.env = _RewardEnvBuilder
+    self_obj.tokenizer = MagicMock()
+    self_obj.tokenizer.encode.side_effect = lambda prompt, **_: [ord(prompt)]
     self_obj.generator = MagicMock()
     # `_get_rank_0_value` is the layer that strips Monarch's ValueMesh,
     # so just make it return whatever it's handed.
-    self_obj._get_rank_0_value = lambda value, has_gpus=True: completions
+    self_obj._get_rank_0_value = lambda value, has_gpus=True: (completions, [])
     return completions
 
 
 class TestCollectRollouts:
+    def test_passes_token_ids_to_generator(self) -> None:
+        """Controller tokenizes env prompts and hands the IDs (not strings)
+        to ``generator.generate.call``."""
+        controller = RLTrainer.__new__(RLTrainer)
+        _build_collect_rollouts_inputs(controller)
+        controller._collect_rollouts(num_groups=2, step=0)
+        # _FakeEnv.prompt == "p"; encode side_effect returns [ord(prompt)] = [112].
+        controller.generator.generate.call.assert_called_once_with([[112], [112]])
+
     def test_emits_expected_metric_keys(self) -> None:
         controller = RLTrainer.__new__(RLTrainer)
         completions = _build_collect_rollouts_inputs(controller)
@@ -179,8 +190,10 @@ class TestCollectRollouts:
         controller.config = MagicMock()
         controller.config.env = MagicMock()
         controller.config.env.build = lambda *, step, group_idx: _FakeEnv({"r": 1.0})
+        controller.tokenizer = MagicMock()
+        controller.tokenizer.encode.side_effect = lambda prompt, **_: [ord(prompt)]
         controller.generator = MagicMock()
-        controller._get_rank_0_value = lambda value, has_gpus=True: completions
+        controller._get_rank_0_value = lambda value, has_gpus=True: (completions, [])
 
         _, rollout_metrics = controller._collect_rollouts(num_groups=2, step=0)
         agg = m.MetricsProcessor._aggregate_metrics(rollout_metrics)
@@ -203,8 +216,10 @@ class TestCollectRollouts:
         controller.config = MagicMock()
         controller.config.env = MagicMock()
         controller.config.env.build = lambda *, step, group_idx: _FakeEnv({"r": 1.0})
+        controller.tokenizer = MagicMock()
+        controller.tokenizer.encode.side_effect = lambda prompt, **_: [ord(prompt)]
         controller.generator = MagicMock()
-        controller._get_rank_0_value = lambda value, has_gpus=True: completions
+        controller._get_rank_0_value = lambda value, has_gpus=True: (completions, [])
 
         _, rollout_metrics = controller._collect_rollouts(num_groups=3, step=0)
         agg = m.MetricsProcessor._aggregate_metrics(rollout_metrics)
@@ -353,11 +368,11 @@ class TestRLTrainerConfigWiring:
         assert "X" not in fresh.metrics.console_log_keys_train
         assert "Y" not in fresh.metrics.console_log_keys_validation
 
-    def test_metrics_default_wandb_disabled(self) -> None:
+    def test_metrics_default_wandb_enabled(self) -> None:
         from torchtitan.experiments.rl.config_registry import rl_grpo_qwen3_0_6b
 
         cfg = rl_grpo_qwen3_0_6b()
-        assert cfg.metrics.enable_wandb is False
+        assert cfg.metrics.enable_wandb is True
         assert cfg.metrics.enable_tensorboard is False
 
 
