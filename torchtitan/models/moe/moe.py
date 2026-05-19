@@ -19,6 +19,385 @@ _MXFP4_MOE_REORDER_FN = None
 _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
 _MXFP4_MOE_SCATTER_SCORES_FN = None
 _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED = False
+_LBT_MOE_ROUTER_DEBUG_COUNT = 0
+_LBT_MOE_FORWARD_DEBUG_COUNT = 0
+_LBT_MOE_ROUTER_INIT_FALLBACK_COUNT = 0
+
+
+def _lbt_env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _lbt_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _lbt_dist_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _lbt_dist_world_size() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    try:
+        return int(os.environ.get("WORLD_SIZE", "1"))
+    except ValueError:
+        return 1
+
+
+def _lbt_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def _lbt_trunc_normal_with_dtensor_fallback_(
+    tensor: torch.Tensor,
+    *,
+    mean: float,
+    std: float,
+) -> None:
+    global _LBT_MOE_ROUTER_INIT_FALLBACK_COUNT
+
+    nn.init.trunc_normal_(tensor, mean=mean, std=std)
+    if _lbt_env_flag("LBT_MOE_ROUTER_INIT_TRACE"):
+        with torch.no_grad():
+            local = _lbt_local_tensor(tensor.detach()).float()
+            print(
+                "[lbt_router_init_trace]"
+                f" rank={_lbt_dist_rank()}"
+                f" type={type(tensor).__name__}"
+                f" is_dtensor={int(isinstance(tensor, DTensor))}"
+                f" dtype={tensor.dtype}"
+                f" shape={tuple(tensor.shape)}"
+                f" local_shape={tuple(local.shape)}"
+                f" std={float(local.std(unbiased=False).item()):.6e}"
+                f" absmax={float(local.abs().max().item()):.6e}",
+                flush=True,
+            )
+    if not _lbt_env_flag("LBT_MOE_ROUTER_INIT_FALLBACK", True):
+        return
+
+    with torch.no_grad():
+        local = _lbt_local_tensor(tensor)
+        if local.numel() == 0:
+            return
+        local_float = local.float()
+        observed_std = local_float.std(unbiased=False)
+        observed_absmax = local_float.abs().max()
+        bad_scale = (
+            not bool(torch.isfinite(observed_std).item())
+            or not bool(torch.isfinite(observed_absmax).item())
+            or float(observed_std.item()) > max(float(std) * 4.0, 1.0e-3)
+            or float(observed_absmax.item()) > max(float(std) * 32.0, 0.25)
+        )
+        if not bad_scale:
+            return
+
+        # Direct BF16 trunc_normal_ can leave rare +/-2.0 outliers on this stack.
+        # Reinitialize through fp32 scratch when the observed router scale is impossible.
+        fresh_float = torch.empty(
+            tuple(local.shape),
+            dtype=torch.float32,
+            device=local.device,
+        )
+        fallback_idx = _LBT_MOE_ROUTER_INIT_FALLBACK_COUNT
+        _LBT_MOE_ROUTER_INIT_FALLBACK_COUNT += 1
+        seed = (
+            int(torch.initial_seed())
+            + 1_000_003 * (fallback_idx + 1)
+            + 9_176 * (_lbt_dist_rank() + 1)
+        ) % ((1 << 63) - 1)
+        generator = torch.Generator(device=local.device)
+        generator.manual_seed(seed)
+        nn.init.trunc_normal_(fresh_float, mean=mean, std=std, generator=generator)
+        fresh_local = fresh_float.to(dtype=local.dtype)
+        if isinstance(tensor, DTensor):
+            replacement = DTensor.from_local(
+                fresh_local,
+                device_mesh=tensor.device_mesh,
+                placements=tensor.placements,
+                run_check=False,
+                shape=tensor.shape,
+                stride=tensor.stride(),
+            )
+            tensor.copy_(replacement)
+        else:
+            tensor.copy_(fresh_local)
+        if _lbt_env_flag("LBT_MOE_ROUTER_INIT_TRACE"):
+            local_float = _lbt_local_tensor(tensor.detach()).float()
+            print(
+                "[lbt_router_init_trace]"
+                f" rank={_lbt_dist_rank()}"
+                " fallback=1"
+                f" fresh_std={float(fresh_local.float().std(unbiased=False).item()):.6e}"
+                f" fresh_absmax={float(fresh_local.float().abs().max().item()):.6e}"
+                f" std={float(local_float.std(unbiased=False).item()):.6e}"
+                f" absmax={float(local_float.abs().max().item()):.6e}",
+                flush=True,
+            )
+
+
+def _lbt_moe_router_debug(
+    router: nn.Module,
+    x: torch.Tensor,
+    scores: torch.Tensor,
+    top_scores: torch.Tensor,
+    selected_experts_indices: torch.Tensor,
+    expert_bias: torch.Tensor | None = None,
+) -> None:
+    global _LBT_MOE_ROUTER_DEBUG_COUNT
+    if not _lbt_env_flag("LBT_MOE_ROUTER_DEBUG"):
+        return
+    if _lbt_env_flag("LBT_MOE_ROUTER_DEBUG_RANK0_ONLY", True) and _lbt_dist_rank() != 0:
+        return
+    name = str(getattr(router, "_lbt_debug_name", ""))
+    filters = [
+        item.strip()
+        for item in os.environ.get("LBT_MOE_ROUTER_DEBUG_FILTER", "").split(",")
+        if item.strip()
+    ]
+    if filters and not any(item in name for item in filters):
+        return
+    limit = _lbt_env_int("LBT_MOE_ROUTER_DEBUG_LIMIT", 16)
+    if limit >= 0 and _LBT_MOE_ROUTER_DEBUG_COUNT >= limit:
+        return
+
+    _LBT_MOE_ROUTER_DEBUG_COUNT += 1
+
+    with torch.no_grad():
+        counts = torch.histc(
+            selected_experts_indices.reshape(-1).float(),
+            bins=router.num_experts,
+            min=0,
+            max=router.num_experts,
+        )
+        counts_total = counts.sum()
+        if float(counts_total.item()) > 0:
+            expert_l1_uniform = (
+                counts / counts_total - (1.0 / float(counts.numel()))
+            ).abs().sum()
+        else:
+            expert_l1_uniform = counts_total
+        ep_degree = _lbt_env_int("LBT_MOE_ROUTER_DEBUG_EP_DEGREE", 0)
+        ep_summary = ""
+        if ep_degree > 1 and counts.numel() % ep_degree == 0:
+            ep_totals = counts.view(ep_degree, counts.numel() // ep_degree).sum(dim=1)
+            ep_total = ep_totals.sum()
+            if float(ep_total.item()) > 0:
+                ep_l1_uniform = (
+                    ep_totals / ep_total - (1.0 / float(ep_totals.numel()))
+                ).abs().sum()
+            else:
+                ep_l1_uniform = ep_total
+            ep_mean = ep_totals.mean()
+            ep_skew = ep_totals.max() / ep_mean if float(ep_mean.item()) > 0 else ep_mean
+            ep_summary = (
+                f" ep_skew={float(ep_skew.item()):.3f}"
+                f" ep_l1_uniform={float(ep_l1_uniform.item()):.6f}"
+                f" ep_totals=[{','.join(f'{float(v.item()):.0f}' for v in ep_totals)}]"
+            )
+        top_count_values, top_count_indices = torch.topk(
+            counts,
+            k=min(6, counts.numel()),
+            largest=True,
+        )
+        bottom_count_values, bottom_count_indices = torch.topk(
+            counts,
+            k=min(6, counts.numel()),
+            largest=False,
+        )
+        score_spread = scores.max(dim=1).values - scores.min(dim=1).values
+        x_float = x.float()
+        input_rms = torch.sqrt(x_float.square().mean())
+        input_std = x_float.std(unbiased=False)
+        gate_weight = getattr(getattr(router, "gate", None), "weight", None)
+        if gate_weight is not None:
+            gate_weight_float = _lbt_local_tensor(gate_weight.detach()).float()
+            gate_weight_absmax = gate_weight_float.abs().max()
+            gate_weight_std = gate_weight_float.std(unbiased=False)
+        else:
+            gate_weight_absmax = scores.new_tensor(float("nan"))
+            gate_weight_std = scores.new_tensor(float("nan"))
+        route_scores = scores
+        if expert_bias is not None and not getattr(router, "_debug_force_load_balance", False):
+            route_scores = route_scores + expert_bias.to(
+                device=route_scores.device,
+                dtype=route_scores.dtype,
+            )
+        margin_k = min(
+            max(2, int(getattr(router, "top_k", 1)) + 1),
+            route_scores.shape[1],
+        )
+        route_top = torch.topk(route_scores.float(), k=margin_k, dim=1).values
+        route_top1_margin = route_top[:, 0] - route_top[:, 1]
+        if margin_k > int(getattr(router, "top_k", 1)):
+            route_boundary_margin = (
+                route_top[:, int(getattr(router, "top_k", 1)) - 1]
+                - route_top[:, int(getattr(router, "top_k", 1))]
+            )
+        else:
+            route_boundary_margin = route_top1_margin.new_empty(0)
+        route_top1_margin_p01 = torch.quantile(route_top1_margin, 0.01)
+        if route_boundary_margin.numel() > 0:
+            route_boundary_margin_mean = route_boundary_margin.mean()
+            route_boundary_margin_p01 = torch.quantile(route_boundary_margin, 0.01)
+        else:
+            route_boundary_margin_mean = route_top1_margin.new_tensor(float("nan"))
+            route_boundary_margin_p01 = route_top1_margin.new_tensor(float("nan"))
+        input_row_zero_frac = (x.abs().sum(dim=1) == 0).float().mean()
+        print(
+            "[lbt_moe_router]"
+            f" call={_LBT_MOE_ROUTER_DEBUG_COUNT - 1}"
+            f" rank={_lbt_dist_rank()}"
+            f" name={name}"
+            f" input_absmax={float(x.abs().max().float().item()):.6e}"
+            f" input_rms={float(input_rms.item()):.6e}"
+            f" input_std={float(input_std.item()):.6e}"
+            f" input_row_zero_frac={float(input_row_zero_frac.item()):.6f}"
+            f" gate_weight_absmax={float(gate_weight_absmax.item()):.6e}"
+            f" gate_weight_std={float(gate_weight_std.item()):.6e}"
+            f" score_absmax={float(scores.abs().max().float().item()):.6e}"
+            f" score_std={float(scores.float().std(unbiased=False).item()):.6e}"
+            f" score_spread_mean={float(score_spread.float().mean().item()):.6e}"
+            f" route_top1_margin_mean={float(route_top1_margin.mean().item()):.6e}"
+            f" route_top1_margin_p01={float(route_top1_margin_p01.item()):.6e}"
+            f" route_boundary_margin_mean={float(route_boundary_margin_mean.item()):.6e}"
+            f" route_boundary_margin_p01={float(route_boundary_margin_p01.item()):.6e}"
+            f" score_nan={int(torch.isnan(scores).sum().item())}"
+            f" score_inf={int(torch.isinf(scores).sum().item())}"
+            f" top_score_mean={float(top_scores.float().mean().item()):.6e}"
+            f" count_min={float(counts.min().item()):.0f}"
+            f" count_max={float(counts.max().item()):.0f}"
+            f" expert_l1_uniform={float(expert_l1_uniform.item()):.6f}"
+            f"{ep_summary}"
+            f" top=[{','.join(f'{int(i.item())}:{float(v.item()):.0f}' for i, v in zip(top_count_indices, top_count_values))}]"
+            f" bottom=[{','.join(f'{int(i.item())}:{float(v.item()):.0f}' for i, v in zip(bottom_count_indices, bottom_count_values))}]",
+            flush=True,
+        )
+
+
+def _lbt_moe_debug_name_matches(name: str, env_name: str) -> bool:
+    filters = [
+        item.strip()
+        for item in os.environ.get(env_name, "").split(",")
+        if item.strip()
+    ]
+    return not filters or any(item in name for item in filters)
+
+
+def _lbt_tensor_debug_summary(label: str, tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return f" {label}=None"
+    with torch.no_grad():
+        data = tensor.detach()
+        finite = torch.isfinite(data)
+        finite_count = int(finite.sum().item())
+        total = data.numel()
+        if total == 0:
+            return f" {label}_numel=0"
+        finite_data = data[finite].float() if finite_count > 0 else data.new_empty(0).float()
+        if finite_count > 0:
+            absmax = float(finite_data.abs().max().item())
+            mean = float(finite_data.mean().item())
+            std = float(finite_data.std(unbiased=False).item())
+        else:
+            absmax = mean = std = float("nan")
+        zero_frac = float((data == 0).float().mean().item())
+        row_zero = ""
+        if data.dim() == 2:
+            row_zero_frac = (data.abs().sum(dim=1) == 0).float().mean()
+            row_zero = f" {label}_row_zero_frac={float(row_zero_frac.item()):.6f}"
+        return (
+            f" {label}_absmax={absmax:.6e}"
+            f" {label}_mean={mean:.6e}"
+            f" {label}_std={std:.6e}"
+            f" {label}_zero_frac={zero_frac:.6f}"
+            f" {label}_nan={int(torch.isnan(data).sum().item())}"
+            f" {label}_inf={int(torch.isinf(data).sum().item())}"
+            f"{row_zero}"
+        )
+
+
+def _lbt_moe_forward_debug(
+    moe: nn.Module,
+    stage: str,
+    *,
+    x_raw: torch.Tensor | None = None,
+    x_normed: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    inv_rms: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+) -> None:
+    global _LBT_MOE_FORWARD_DEBUG_COUNT
+    if not _lbt_env_flag("LBT_MOE_FORWARD_DEBUG"):
+        return
+    if _lbt_env_flag("LBT_MOE_FORWARD_DEBUG_RANK0_ONLY", True) and _lbt_dist_rank() != 0:
+        return
+    name = str(getattr(moe, "_lbt_debug_name", ""))
+    if not _lbt_moe_debug_name_matches(name, "LBT_MOE_FORWARD_DEBUG_FILTER"):
+        return
+    limit = _lbt_env_int("LBT_MOE_FORWARD_DEBUG_LIMIT", 32)
+    if limit >= 0 and _LBT_MOE_FORWARD_DEBUG_COUNT >= limit:
+        return
+
+    call = _LBT_MOE_FORWARD_DEBUG_COUNT
+    _LBT_MOE_FORWARD_DEBUG_COUNT += 1
+    print(
+        "[lbt_moe_forward]"
+        f" call={call}"
+        f" rank={_lbt_dist_rank()}"
+        f" name={name}"
+        f" stage={stage}"
+        + _lbt_tensor_debug_summary("x_raw", x_raw)
+        + _lbt_tensor_debug_summary("x_normed", x_normed)
+        + _lbt_tensor_debug_summary("norm_weight", norm_weight)
+        + _lbt_tensor_debug_summary("inv_rms", inv_rms)
+        + _lbt_tensor_debug_summary("output", output),
+        flush=True,
+    )
+
+
+def _lbt_moe_init_debug(moe: nn.Module, init_std: float) -> None:
+    if not _lbt_env_flag("LBT_MOE_INIT_DEBUG"):
+        return
+    if _lbt_env_flag("LBT_MOE_INIT_DEBUG_RANK0_ONLY", True) and _lbt_dist_rank() != 0:
+        return
+    name = str(getattr(moe, "_lbt_debug_name", ""))
+    if not _lbt_moe_debug_name_matches(name, "LBT_MOE_INIT_DEBUG_FILTER"):
+        return
+    router = getattr(moe, "router", None)
+    gate_weight = getattr(getattr(router, "gate", None), "weight", None)
+    if gate_weight is None:
+        return
+    with torch.no_grad():
+        data = _lbt_local_tensor(gate_weight.detach()).float()
+        print(
+            "[lbt_moe_init]"
+            f" rank={_lbt_dist_rank()}"
+            f" name={name}"
+            f" init_std={float(init_std):.6e}"
+            f" gate_weight_type={type(gate_weight).__name__}"
+            f" gate_weight_is_dtensor={int(isinstance(gate_weight, DTensor))}"
+            f" gate_weight_dtype={gate_weight.dtype}"
+            f" gate_weight_shape={tuple(gate_weight.shape)}"
+            f" gate_weight_local_shape={tuple(data.shape)}"
+            f" gate_weight_absmax={float(data.abs().max().item()):.6e}"
+            f" gate_weight_std={float(data.std(unbiased=False).item()):.6e}",
+            flush=True,
+        )
+
+
+def _lbt_reset_moved_ffn_norm() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_RESET_MOVED_FFN_NORM", True)
 
 
 def _get_mxfp4_moe_reorder_fn():
@@ -65,6 +444,15 @@ def _mxfp4_deepseek_grouped_m_granularity() -> int:
     except ValueError:
         value = 256
     return value if value in (256, 512, 1024) else 256
+
+
+def _mxfp4_deepseek_route_scores_full_producer(num_experts: int) -> bool:
+    raw = os.environ.get("MXFP4_DEEPSEEK_ROUTE_SCORES_FULL_PRODUCER", "auto").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return int(num_experts) <= 16
 
 
 class _MXFP4MoERouteScoresFunction(torch.autograd.Function):
@@ -406,6 +794,16 @@ class TokenChoiceTopKRouter(nn.Module):
                 scores, k=self.top_k, dim=1
             )
 
+        if "LBT_MOE_ROUTER_DEBUG" in os.environ:
+            _lbt_moe_router_debug(
+                self,
+                x,
+                scores,
+                top_scores,
+                selected_experts_indices,
+                expert_bias,
+            )
+
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
@@ -430,7 +828,11 @@ class TokenChoiceTopKRouter(nn.Module):
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
     def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
+        _lbt_trunc_normal_with_dtensor_fallback_(
+            self.gate.weight,
+            mean=0.0,
+            std=init_std,
+        )
 
 
 # NOTE: the reason we make this a stateless module is to support
@@ -697,6 +1099,7 @@ class MoE(nn.Module):
         indexed_x_rms_inv = None
         rms_norm = getattr(self, "_mxfp4_ffn_norm", None)
         rmsnorm_to_bf16 = getattr(self, "_mxfp4_rmsnorm_to_bf16", None)
+        norm_weight = None
         if rms_norm is not None and rmsnorm_to_bf16 is not None:
             norm_weight = getattr(rms_norm, "weight", None)
             if norm_weight is not None:
@@ -708,11 +1111,30 @@ class MoE(nn.Module):
                 indexed_x_rms_base = x_raw
                 indexed_x_rms_weight = norm_weight
 
+        forward_debug_enabled = "LBT_MOE_FORWARD_DEBUG" in os.environ
+        if forward_debug_enabled:
+            _lbt_moe_forward_debug(
+                self,
+                "pre_router",
+                x_raw=x_raw,
+                x_normed=x,
+                norm_weight=norm_weight,
+                inv_rms=indexed_x_rms_inv,
+            )
+
         fused_moe_combine = (
             getattr(self.experts, "forward_moe_combine", None)
             if not self.score_before_experts
             else None
         )
+        if fused_moe_combine is not None and _lbt_dist_world_size() > 1:
+            can_fuse_moe_combine = getattr(self.experts, "can_fuse_moe_combine", None)
+            if can_fuse_moe_combine is not None:
+                try:
+                    if not can_fuse_moe_combine(self.reorderer.num_experts):
+                        fused_moe_combine = None
+                except Exception:
+                    fused_moe_combine = None
         skip_router_histc = (
             fused_moe_combine is not None
             and os.environ.get("MXFP4_DEEPSEEK_SKIP_ROUTER_HISTC", "1") != "0"
@@ -767,7 +1189,7 @@ class MoE(nn.Module):
         if (
             not self.router._debug_force_load_balance
             and fused_moe_combine_unsorted is not None
-            and os.environ.get("MXFP4_DEEPSEEK_ROUTE_SCORES_FULL_PRODUCER", "0") != "0"
+            and _mxfp4_deepseek_route_scores_full_producer(self.reorderer.num_experts)
         ):
             try:
                 (
@@ -850,6 +1272,12 @@ class MoE(nn.Module):
                 **fused_kwargs,
             )
             if fused_out is not None:
+                if forward_debug_enabled:
+                    _lbt_moe_forward_debug(
+                        self,
+                        "fused_moe_with_shared_output",
+                        output=fused_out,
+                    )
                 return fused_out.reshape(bs, slen, dim)
 
         if fused_moe_combine_unsorted is not None and not route_full_producer_used:
@@ -866,6 +1294,12 @@ class MoE(nn.Module):
             if fused_out is not None:
                 if self.shared_experts is not None:
                     fused_out = fused_out + self.shared_experts(x)
+                if forward_debug_enabled:
+                    _lbt_moe_forward_debug(
+                        self,
+                        "fused_moe_unsorted_output",
+                        output=fused_out,
+                    )
                 return fused_out.reshape(bs, slen, dim)
 
         if fused_moe_combine is not None:
@@ -884,6 +1318,12 @@ class MoE(nn.Module):
             if fused_out is not None:
                 if self.shared_experts is not None:
                     fused_out = fused_out + self.shared_experts(x)
+                if forward_debug_enabled:
+                    _lbt_moe_forward_debug(
+                        self,
+                        "fused_moe_sorted_output",
+                        output=fused_out,
+                    )
                 return fused_out.reshape(bs, slen, dim)
 
         # shape (bs*slen*top_k, dim)
@@ -921,6 +1361,12 @@ class MoE(nn.Module):
             dim=0, index=token_indices_experts_sorted, src=routed_output
         )
         out = out.reshape(bs, slen, dim)
+        if forward_debug_enabled:
+            _lbt_moe_forward_debug(
+                self,
+                "fallback_output",
+                output=out,
+            )
         return out
 
     def init_weights(
@@ -930,8 +1376,17 @@ class MoE(nn.Module):
     ):
         self.experts.init_weights(init_std)
         self.router.init_weights(init_std)
+        if "LBT_MOE_INIT_DEBUG" in os.environ:
+            _lbt_moe_init_debug(self, init_std)
         if self.shared_experts is not None:
             self.shared_experts.init_weights(init_std)
+        mxfp4_ffn_norm = getattr(self, "_mxfp4_ffn_norm", None)
+        if (
+            _lbt_reset_moved_ffn_norm()
+            and mxfp4_ffn_norm is not None
+            and hasattr(mxfp4_ffn_norm, "reset_parameters")
+        ):
+            mxfp4_ffn_norm.reset_parameters()
 
         with torch.device(buffer_device):
             self.tokens_per_expert = torch.zeros(

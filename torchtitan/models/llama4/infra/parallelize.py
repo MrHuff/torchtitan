@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -386,55 +388,98 @@ def apply_fsdp(
     fully_shard(model, **fsdp_config)
 
     # NOTE: set up explicit prefetching when EP is enabled, as D2H syncs
-    # in EP could interfere with implicit prefetching in FSDP
-    if ep_degree == 1:
+    # in EP could interfere with implicit prefetching in FSDP.
+    #
+    # DeepSeek MXFP4 profiling on small GPU counts can be dominated by NCCL
+    # contention, so keep this tunable for topology sweeps while preserving the
+    # upstream default when the env is unset.
+    prefetch_mode = os.environ.get("LBT_FSDP_EP_PREFETCH", "both").strip().lower()
+    if ep_degree == 1 or prefetch_mode in {"0", "false", "off", "none"}:
+        return
+    forward_prefetch_enabled = prefetch_mode in {
+        "1",
+        "true",
+        "both",
+        "forward",
+        "fw",
+        "block",
+        "block_only",
+        "blocks",
+    }
+    backward_prefetch_enabled = prefetch_mode in {
+        "1",
+        "true",
+        "both",
+        "backward",
+        "bw",
+        "block",
+        "block_only",
+        "blocks",
+    }
+    prefetch_experts = prefetch_mode not in {"block", "block_only", "blocks"}
+    if not forward_prefetch_enabled and not backward_prefetch_enabled:
+        logger.warning(
+            "Unknown LBT_FSDP_EP_PREFETCH=%s; disabling explicit EP FSDP prefetch",
+            prefetch_mode,
+        )
         return
 
     # forward
     transformer_blocks = list(model.layers.values())
     next_transformer_blocks = transformer_blocks[1:] + [None]
 
-    if model.tok_embeddings is not None and len(model.layers) > 0:
+    if (
+        forward_prefetch_enabled
+        and model.tok_embeddings is not None
+        and len(model.layers) > 0
+    ):
         model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
 
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks, next_transformer_blocks
-    ):
-        if next_transformer_block is not None:
-            if next_transformer_block.moe_enabled:
+    if forward_prefetch_enabled:
+        for transformer_block, next_transformer_block in zip(
+            transformer_blocks, next_transformer_blocks
+        ):
+            if next_transformer_block is not None:
+                if next_transformer_block.moe_enabled and prefetch_experts:
+                    transformer_block.set_modules_to_forward_prefetch(
+                        [next_transformer_block, next_transformer_block.moe.experts]
+                    )
+                else:
+                    transformer_block.set_modules_to_forward_prefetch(
+                        [next_transformer_block]
+                    )
+            elif model.norm is not None and model.output is not None:
                 transformer_block.set_modules_to_forward_prefetch(
-                    [next_transformer_block, next_transformer_block.moe.experts]
+                    [model.norm, model.output]
                 )
-            else:
-                transformer_block.set_modules_to_forward_prefetch(
-                    [next_transformer_block]
-                )
-        elif model.norm is not None and model.output is not None:
-            transformer_block.set_modules_to_forward_prefetch(
-                [model.norm, model.output]
-            )
 
     # backward
     reversed_transformer_blocks = list(reversed(model.layers.values()))
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if model.norm is not None and model.output is not None and len(model.layers) > 0:
+    if (
+        backward_prefetch_enabled
+        and model.norm is not None
+        and model.output is not None
+        and len(model.layers) > 0
+    ):
         model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks, prev_transformer_blocks
-    ):
-        if prev_transformer_block is not None:
-            if prev_transformer_block.moe_enabled:
-                transformer_block.set_modules_to_backward_prefetch(
-                    [prev_transformer_block, prev_transformer_block.moe.experts]
-                )
-            else:
-                transformer_block.set_modules_to_backward_prefetch(
-                    [prev_transformer_block]
-                )
-        elif model.tok_embeddings is not None:
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+    if backward_prefetch_enabled:
+        for transformer_block, prev_transformer_block in zip(
+            reversed_transformer_blocks, prev_transformer_blocks
+        ):
+            if prev_transformer_block is not None:
+                if prev_transformer_block.moe_enabled and prefetch_experts:
+                    transformer_block.set_modules_to_backward_prefetch(
+                        [prev_transformer_block, prev_transformer_block.moe.experts]
+                    )
+                else:
+                    transformer_block.set_modules_to_backward_prefetch(
+                        [prev_transformer_block]
+                    )
+            elif model.tok_embeddings is not None:
+                transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
 
 def apply_moe_ep_tp(

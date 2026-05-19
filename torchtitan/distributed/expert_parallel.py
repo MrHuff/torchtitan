@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.distributed._functional_collectives import (
@@ -22,6 +24,264 @@ from torch.distributed.tensor import (
 from torch.distributed.tensor.parallel import ParallelStyle
 
 from torchtitan.models.moe.utils import _permute, _unpermute
+
+
+_LBT_EP_DEBUG_SPLIT_COUNT = 0
+
+
+def _lbt_env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _lbt_ep_debug_split_limit() -> int:
+    try:
+        return int(os.environ.get("LBT_EP_DEBUG_SPLIT_LIMIT", "32"))
+    except ValueError:
+        return 32
+
+
+def _lbt_split_stats(splits: list[int]) -> tuple[int, int, float]:
+    if not splits:
+        return 0, 0, 0.0
+    total = sum(int(split) for split in splits)
+    max_split = max(int(split) for split in splits)
+    mean_split = total / len(splits) if total > 0 else 0.0
+    ratio = max_split / mean_split if mean_split > 0 else 0.0
+    return total, max_split, ratio
+
+
+def _lbt_ep_a2a_mode(env_name: str = "LBT_EP_A2A_COMPRESS") -> str:
+    value = os.environ.get(env_name, os.environ.get("LBT_EP_A2A_COMPRESS", "none"))
+    value = value.lower()
+    if value in ("", "0", "false", "no", "none", "off"):
+        return "none"
+    if value in ("1", "true", "yes", "on", "fp8", "e4m3", "fp8_e4m3"):
+        return "fp8_e4m3"
+    if value in ("e5m2", "fp8_e5m2"):
+        return "fp8_e5m2"
+    raise ValueError(
+        f"Unsupported {env_name}={value}. Expected none, fp8_e4m3, or fp8_e5m2."
+    )
+
+
+def _lbt_ep_a2a_scale_mode() -> str:
+    value = os.environ.get("LBT_EP_A2A_SCALE_MODE", "dynamic").lower()
+    if value in ("static", "fixed"):
+        return "static"
+    if value in ("dynamic", "amax"):
+        return "dynamic"
+    raise ValueError(
+        "Unsupported LBT_EP_A2A_SCALE_MODE="
+        f"{value}. Expected dynamic or static."
+    )
+
+
+def _lbt_fp8_dtype(mode: str) -> torch.dtype:
+    if mode == "fp8_e4m3":
+        return torch.float8_e4m3fn
+    if mode == "fp8_e5m2":
+        return torch.float8_e5m2
+    raise ValueError(f"Unsupported FP8 all-to-all mode: {mode}")
+
+
+def _lbt_static_fp8_scale(device: torch.device) -> torch.Tensor:
+    try:
+        scale = float(os.environ.get("LBT_EP_A2A_FP8_STATIC_SCALE", "1.0"))
+    except ValueError:
+        scale = 1.0
+    if scale <= 0:
+        scale = 1.0
+    return torch.tensor(scale, device=device, dtype=torch.float32)
+
+
+def _lbt_gather_ep_scales(scale: torch.Tensor, group) -> torch.Tensor:
+    world_size = torch.distributed.get_world_size(group)
+    scales = torch.empty(world_size, device=scale.device, dtype=torch.float32)
+    torch.distributed.all_gather_into_tensor(scales, scale.reshape(1), group=group)
+    return scales
+
+
+def _lbt_quantize_fp8_for_a2a(
+    tensor: torch.Tensor,
+    mode: str,
+    group,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_dtype = _lbt_fp8_dtype(mode)
+    fp8_max = torch.finfo(fp8_dtype).max
+    if _lbt_ep_a2a_scale_mode() == "static":
+        scale = _lbt_static_fp8_scale(tensor.device)
+    elif tensor.numel() == 0:
+        scale = torch.tensor(1.0, device=tensor.device, dtype=torch.float32)
+    else:
+        amax = tensor.detach().abs().amax().float()
+        scale = torch.clamp(amax / fp8_max, min=1.0e-12)
+
+    scales = _lbt_gather_ep_scales(scale, group)
+    payload = torch.clamp(tensor / scale, min=-fp8_max, max=fp8_max).to(fp8_dtype)
+    return payload.contiguous(), scales
+
+
+def _lbt_apply_source_scales(
+    tensor: torch.Tensor,
+    output_splits: list[int],
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    offset = 0
+    for source_rank, split in enumerate(output_splits):
+        split = int(split)
+        if split > 0:
+            tensor.narrow(0, offset, split).mul_(
+                scales[source_rank].to(device=tensor.device, dtype=tensor.dtype)
+            )
+        offset += split
+    return tensor
+
+
+def _lbt_all_to_all_no_autograd(
+    tensor: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group,
+) -> torch.Tensor:
+    output_shape = (sum(output_splits), *tensor.shape[1:])
+    output = torch.empty(output_shape, device=tensor.device, dtype=tensor.dtype)
+    torch.distributed.all_to_all_single(
+        output,
+        tensor.contiguous(),
+        output_split_sizes=output_splits,
+        input_split_sizes=input_splits,
+        group=group,
+    )
+    return output
+
+
+def _lbt_compressed_all_to_all(
+    tensor: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group,
+    mode: str,
+) -> torch.Tensor:
+    if mode == "none":
+        return _lbt_all_to_all_no_autograd(tensor, output_splits, input_splits, group)
+
+    output_dtype = tensor.dtype
+    payload, source_scales = _lbt_quantize_fp8_for_a2a(tensor, mode, group)
+    output = _lbt_all_to_all_no_autograd(
+        payload,
+        output_splits,
+        input_splits,
+        group,
+    ).to(output_dtype)
+    return _lbt_apply_source_scales(output, output_splits, source_scales)
+
+
+class _LBTCompressedAllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        output_splits: list[int],
+        input_splits: list[int],
+        group,
+        forward_mode: str,
+        backward_mode: str,
+    ) -> torch.Tensor:
+        ctx.output_splits = [int(split) for split in output_splits]
+        ctx.input_splits = [int(split) for split in input_splits]
+        ctx.group = group
+        ctx.backward_mode = backward_mode
+        return _lbt_compressed_all_to_all(
+            tensor,
+            ctx.output_splits,
+            ctx.input_splits,
+            group,
+            forward_mode,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = _lbt_compressed_all_to_all(
+            grad_output,
+            ctx.input_splits,
+            ctx.output_splits,
+            ctx.group,
+            ctx.backward_mode,
+        )
+        return grad_input, None, None, None, None, None
+
+
+def _lbt_all_to_all_single_autograd(
+    tensor: torch.Tensor,
+    output_splits: list[int],
+    input_splits: list[int],
+    group,
+) -> torch.Tensor:
+    forward_mode = _lbt_ep_a2a_mode()
+    if forward_mode == "none":
+        return all_to_all_single_autograd(
+            tensor,
+            output_splits,
+            input_splits,
+            group,
+        )
+
+    backward_mode = _lbt_ep_a2a_mode("LBT_EP_A2A_COMPRESS_BWD")
+    return _LBTCompressedAllToAll.apply(
+        tensor,
+        output_splits,
+        input_splits,
+        group,
+        forward_mode,
+        backward_mode,
+    )
+
+
+def _lbt_debug_ep_splits(
+    phase: str,
+    tensor: torch.Tensor,
+    input_splits: list[int],
+    output_splits: list[int],
+    device_mesh: DeviceMesh,
+):
+    global _LBT_EP_DEBUG_SPLIT_COUNT
+    if not _lbt_env_flag("LBT_EP_DEBUG_SPLITS"):
+        return
+    if _LBT_EP_DEBUG_SPLIT_COUNT >= _lbt_ep_debug_split_limit():
+        return
+
+    call_idx = _LBT_EP_DEBUG_SPLIT_COUNT
+    _LBT_EP_DEBUG_SPLIT_COUNT += 1
+
+    try:
+        rank = torch.distributed.get_rank()
+    except Exception:
+        rank = -1
+    try:
+        ep_rank = device_mesh.get_local_rank()
+    except Exception:
+        ep_rank = -1
+
+    in_total, in_max, in_ratio = _lbt_split_stats(input_splits)
+    out_total, out_max, out_ratio = _lbt_split_stats(output_splits)
+    row_elems = tensor.numel() // max(int(tensor.shape[0]), 1)
+    elem_size = tensor.element_size()
+    in_mib = in_total * row_elems * elem_size / (1024 * 1024)
+    out_mib = out_total * row_elems * elem_size / (1024 * 1024)
+
+    print(
+        "[lbt_ep_debug] "
+        f"call={call_idx} phase={phase} rank={rank} ep_rank={ep_rank} "
+        f"a2a_compress={_lbt_ep_a2a_mode()} "
+        f"dtype={tensor.dtype} shape={tuple(tensor.shape)} row_elems={row_elems} "
+        f"in_total={in_total} in_max={in_max} in_skew={in_ratio:.3f} in_mib={in_mib:.2f} "
+        f"out_total={out_total} out_max={out_max} out_skew={out_ratio:.3f} out_mib={out_mib:.2f} "
+        f"input_splits={input_splits} output_splits={output_splits}",
+        flush=True,
+    )
 
 
 # implementation of Tensor Parallel for the GroupedExperts in MoE
@@ -76,6 +336,8 @@ class ExpertParallel(ParallelStyle):
     def _token_dispatch(self, mod, inputs, device_mesh):
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
+        if num_tokens_per_expert.dtype not in (torch.int32, torch.int64):
+            num_tokens_per_expert = num_tokens_per_expert.to(torch.int64)
         ep_degree = device_mesh.shape[0]
         num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
 
@@ -106,8 +368,16 @@ class ExpertParallel(ParallelStyle):
             self.input_splits = input_splits.tolist()
             self.output_splits = output_splits.tolist()
 
+        _lbt_debug_ep_splits(
+            "dispatch",
+            routed_input,
+            self.input_splits,
+            self.output_splits,
+            device_mesh,
+        )
+
         # perform all-to-all
-        routed_input = all_to_all_single_autograd(
+        routed_input = _lbt_all_to_all_single_autograd(
             routed_input,
             self.output_splits,
             self.input_splits,
@@ -150,7 +420,15 @@ class ExpertParallel(ParallelStyle):
             routed_output, self.input_shape, self.permuted_indices
         )
 
-        routed_output = all_to_all_single_autograd(
+        _lbt_debug_ep_splits(
+            "combine",
+            routed_output,
+            self.output_splits,
+            self.input_splits,
+            device_mesh,
+        )
+
+        routed_output = _lbt_all_to_all_single_autograd(
             routed_output,
             self.input_splits,
             self.output_splits,
