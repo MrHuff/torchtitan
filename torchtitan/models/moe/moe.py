@@ -17,7 +17,14 @@ from .utils import indices_padding_wrapper
 
 _MXFP4_MOE_REORDER_FN = None
 _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
+_MXFP4_MOE_GATHER_SCORES_FN = None
 _MXFP4_MOE_SCATTER_SCORES_FN = None
+_MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
+_MXFP4_MOE_ROUTE_COMBINE_ADD_FN = None
+_MXFP4_MOE_SCALE_SCATTER_ADD_FN = None
+_MXFP4_MOE_INDEXED_DOT_ROWS_FN = None
+_MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = None
+_MXFP4_MOE_INDEXED_SCALE_ROWS_FN = None
 _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED = False
 _LBT_MOE_ROUTER_DEBUG_COUNT = 0
 _LBT_MOE_FORWARD_DEBUG_COUNT = 0
@@ -416,25 +423,90 @@ def _get_mxfp4_moe_scatter_scores_fn():
     return _MXFP4_MOE_SCATTER_SCORES_FN
 
 
+def _get_mxfp4_moe_gather_scores_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_GATHER_SCORES_FN
+
+
+def _get_mxfp4_moe_build_route_inverse_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN
+
+
+def _get_mxfp4_moe_route_combine_add_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_ROUTE_COMBINE_ADD_FN
+
+
+def _get_mxfp4_moe_scale_scatter_add_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_SCALE_SCATTER_ADD_FN
+
+
+def _get_mxfp4_moe_indexed_dot_rows_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_INDEXED_DOT_ROWS_FN
+
+
+def _get_mxfp4_moe_indexed_scale_dot_rows_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN
+
+
+def _get_mxfp4_moe_indexed_scale_rows_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_INDEXED_SCALE_ROWS_FN
+
+
 def _ensure_mxfp4_moe_route_imports():
-    global _MXFP4_MOE_REORDER_FN, _MXFP4_MOE_REORDER_SCORES_FULL_FN, _MXFP4_MOE_SCATTER_SCORES_FN, _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED
+    global _MXFP4_MOE_REORDER_FN, _MXFP4_MOE_REORDER_SCORES_FULL_FN
+    global _MXFP4_MOE_GATHER_SCORES_FN, _MXFP4_MOE_SCATTER_SCORES_FN
+    global _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN
+    global _MXFP4_MOE_ROUTE_COMBINE_ADD_FN, _MXFP4_MOE_SCALE_SCATTER_ADD_FN
+    global _MXFP4_MOE_INDEXED_DOT_ROWS_FN, _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN
+    global _MXFP4_MOE_INDEXED_SCALE_ROWS_FN
+    global _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED
     if _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED:
         return
     _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED = True
     try:
-        from low_bits_training.quantization.mxfp4_backend import (
-            mxfp4_moe_reorder_indices,
-            mxfp4_moe_reorder_scores_full,
-            mxfp4_moe_scatter_scores,
-        )
-    except (ImportError, AttributeError):
+        from low_bits_training.quantization import mxfp4_backend
+    except ImportError:
         _MXFP4_MOE_REORDER_FN = None
         _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
+        _MXFP4_MOE_GATHER_SCORES_FN = None
         _MXFP4_MOE_SCATTER_SCORES_FN = None
+        _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
+        _MXFP4_MOE_ROUTE_COMBINE_ADD_FN = None
+        _MXFP4_MOE_SCALE_SCATTER_ADD_FN = None
+        _MXFP4_MOE_INDEXED_DOT_ROWS_FN = None
+        _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = None
+        _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = None
     else:
-        _MXFP4_MOE_REORDER_FN = mxfp4_moe_reorder_indices
-        _MXFP4_MOE_REORDER_SCORES_FULL_FN = mxfp4_moe_reorder_scores_full
-        _MXFP4_MOE_SCATTER_SCORES_FN = mxfp4_moe_scatter_scores
+        _MXFP4_MOE_REORDER_FN = getattr(mxfp4_backend, "mxfp4_moe_reorder_indices", None)
+        _MXFP4_MOE_REORDER_SCORES_FULL_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_reorder_scores_full", None
+        )
+        _MXFP4_MOE_GATHER_SCORES_FN = getattr(mxfp4_backend, "mxfp4_moe_gather_scores", None)
+        _MXFP4_MOE_SCATTER_SCORES_FN = getattr(mxfp4_backend, "mxfp4_moe_scatter_scores", None)
+        _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_build_route_inverse", None
+        )
+        _MXFP4_MOE_ROUTE_COMBINE_ADD_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_route_combine_add_bf16", None
+        )
+        _MXFP4_MOE_SCALE_SCATTER_ADD_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_scale_scatter_add_bf16", None
+        )
+        _MXFP4_MOE_INDEXED_DOT_ROWS_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_indexed_dot_rows_bf16", None
+        )
+        _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_indexed_scale_dot_rows_bf16", None
+        )
+        _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_indexed_scale_rows_bf16", None
+        )
 
 
 def _mxfp4_deepseek_grouped_m_granularity() -> int:
@@ -446,7 +518,21 @@ def _mxfp4_deepseek_grouped_m_granularity() -> int:
     return value if value in (256, 512, 1024) else 256
 
 
+def _mxfp4_deepseek_allow_unsafe_tk_ep_route() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_ALLOW_UNSAFE_TK_EP_ROUTE", False)
+
+
+def _mxfp4_deepseek_validate_tk_ep_route() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_VALIDATE_TK_EP_ROUTE", False)
+
+
+def _mxfp4_deepseek_can_use_tk_route_producer() -> bool:
+    return _lbt_dist_world_size() <= 1 or _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+
+
 def _mxfp4_deepseek_route_scores_full_producer(num_experts: int) -> bool:
+    if not _mxfp4_deepseek_can_use_tk_route_producer():
+        return False
     raw = os.environ.get("MXFP4_DEEPSEEK_ROUTE_SCORES_FULL_PRODUCER", "auto").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return True
@@ -455,12 +541,109 @@ def _mxfp4_deepseek_route_scores_full_producer(num_experts: int) -> bool:
     return int(num_experts) <= 16
 
 
+def _mxfp4_deepseek_route_scores_full_fallback() -> bool:
+    return (
+        _mxfp4_deepseek_can_use_tk_route_producer()
+        and _lbt_env_flag("MXFP4_DEEPSEEK_ROUTE_SCORES_FULL_FALLBACK", False)
+    )
+
+
+def _mxfp4_deepseek_tk_scored_fallback_combine() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_SCORED_FALLBACK_COMBINE", True)
+
+
+def _mxfp4_deepseek_tk_scored_fallback_combine_fwd() -> bool:
+    return _lbt_env_flag(
+        "MXFP4_DEEPSEEK_TK_SCORED_FALLBACK_COMBINE_FWD",
+        _mxfp4_deepseek_tk_scored_fallback_combine(),
+    )
+
+
+def _mxfp4_deepseek_tk_scored_fallback_combine_bwd() -> bool:
+    return _lbt_env_flag(
+        "MXFP4_DEEPSEEK_TK_SCORED_FALLBACK_COMBINE_BWD",
+        False,
+    )
+
+
+def _mxfp4_deepseek_tk_indexed_scale_bwd() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_INDEXED_SCALE_BWD", True)
+
+
+def _mxfp4_deepseek_tk_score_gather() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_SCORE_GATHER", True)
+
+
+def _mxfp4_deepseek_tk_route_inverse_fallback_combine() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_ROUTE_INVERSE_FALLBACK_COMBINE", False)
+
+
+def _mxfp4_deepseek_indexed_fallback_combine() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_INDEXED_FALLBACK_COMBINE", True)
+
+
+def _mxfp4_deepseek_scored_indexed_fallback_combine() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_SCORED_INDEXED_FALLBACK_COMBINE", True)
+
+
 def _mxfp4_as_contiguous_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     if tensor.dtype != dtype:
         tensor = tensor.to(dtype)
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     return tensor
+
+
+def _lbt_wait_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.is_cuda:
+        return torch.ops._c10d_functional.wait_tensor(tensor)
+    return tensor
+
+
+def _lbt_validate_ep_route_counts(counts: torch.Tensor, routes: int) -> None:
+    if not _mxfp4_deepseek_validate_tk_ep_route():
+        return
+    if (
+        _lbt_dist_world_size() <= 1
+        and not _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+    ):
+        return
+    if int(counts.to(torch.int64).sum().item()) != int(routes):
+        raise RuntimeError("TK route producer counts do not match routed rows under EP")
+
+
+def _lbt_ep_route_counts_match(counts: torch.Tensor, routes: int) -> bool:
+    if not _mxfp4_deepseek_validate_tk_ep_route():
+        return True
+    if (
+        _lbt_dist_world_size() <= 1
+        and not _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+    ):
+        return True
+    return int(counts.to(torch.int64).sum().item()) == int(routes)
+
+
+def _lbt_route_positions_are_permutation(
+    route_positions: torch.Tensor | None,
+    routes: int,
+) -> bool:
+    if route_positions is None:
+        return False
+    route_positions = route_positions.reshape(-1)
+    if int(route_positions.numel()) != int(routes):
+        return False
+    if routes == 0:
+        return True
+    if int(route_positions.min().item()) < 0:
+        return False
+    if int(route_positions.max().item()) >= int(routes):
+        return False
+    return int(torch.unique(route_positions).numel()) == int(routes)
+
+
+def _lbt_sync_unsafe_tk_route(tensor: torch.Tensor) -> None:
+    if _mxfp4_deepseek_allow_unsafe_tk_ep_route() and tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
 
 
 class _MXFP4MoERouteScoresFunction(torch.autograd.Function):
@@ -510,6 +693,272 @@ class _MXFP4MoERouteScoresFunction(torch.autograd.Function):
                 ctx.num_scores,
             )
         return grad_flat.reshape(ctx.orig_shape), None, None, None, None
+
+
+class _MXFP4MoEScoreGatherFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, scores: torch.Tensor, route_positions: torch.Tensor):
+        route_positions = _mxfp4_as_contiguous_dtype(route_positions.reshape(-1), torch.int64)
+        flat_scores = _mxfp4_as_contiguous_dtype(scores.reshape(-1), torch.float32)
+        ctx.orig_shape = tuple(scores.shape)
+        ctx.score_dtype = scores.dtype
+        ctx.num_scores = int(flat_scores.numel())
+        ctx.save_for_backward(route_positions)
+        gather_fn = _get_mxfp4_moe_gather_scores_fn()
+        if gather_fn is None:
+            return flat_scores[route_positions].to(ctx.score_dtype)
+        try:
+            return gather_fn(flat_scores, route_positions).to(ctx.score_dtype)
+        except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+            return flat_scores[route_positions].to(ctx.score_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_sorted_scores: torch.Tensor):
+        (route_positions,) = ctx.saved_tensors
+        grad_sorted_scores = _mxfp4_as_contiguous_dtype(
+            grad_sorted_scores.reshape(-1),
+            torch.float32,
+        )
+        scatter_fn = _get_mxfp4_moe_scatter_scores_fn()
+        if scatter_fn is None:
+            grad_flat = torch.empty(
+                (ctx.num_scores,),
+                device=grad_sorted_scores.device,
+                dtype=torch.float32,
+            )
+            grad_flat[route_positions] = grad_sorted_scores
+        else:
+            try:
+                grad_flat = scatter_fn(grad_sorted_scores, route_positions, ctx.num_scores)
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                grad_flat = torch.empty(
+                    (ctx.num_scores,),
+                    device=grad_sorted_scores.device,
+                    dtype=torch.float32,
+                )
+                grad_flat[route_positions] = grad_sorted_scores
+        return grad_flat.reshape(ctx.orig_shape).to(ctx.score_dtype), None
+
+
+def _mxfp4_gather_route_scores(
+    top_scores: torch.Tensor,
+    route_positions: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        _mxfp4_deepseek_tk_score_gather()
+        and top_scores.is_cuda
+        and route_positions.is_cuda
+    ):
+        return _MXFP4MoEScoreGatherFunction.apply(top_scores, route_positions)
+    return top_scores.reshape(-1)[route_positions]
+
+
+class _MoEIndexCombineFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        base: torch.Tensor,
+        token_indices: torch.Tensor,
+        routed_output: torch.Tensor,
+    ):
+        token_indices = token_indices.reshape(-1).contiguous()
+        ctx.save_for_backward(token_indices)
+        out = base.clone()
+        out.index_add_(0, token_indices, routed_output)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (token_indices,) = ctx.saved_tensors
+        grad_base = grad_output
+        grad_routed_output = grad_output.index_select(0, token_indices)
+        return grad_base, None, grad_routed_output
+
+
+class _MoEScoredIndexCombineFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        base: torch.Tensor,
+        token_indices: torch.Tensor,
+        routed_output: torch.Tensor,
+        scores: torch.Tensor,
+        route_inverse: torch.Tensor | None,
+        top_k: int,
+    ):
+        token_indices = token_indices.reshape(-1).contiguous()
+        score_dtype = scores.dtype
+        scores = _mxfp4_as_contiguous_dtype(scores.reshape(-1), torch.float32)
+        ctx.score_dtype = score_dtype
+        saved_for_backward = False
+
+        if (
+            _mxfp4_deepseek_tk_scored_fallback_combine_fwd()
+            and base.is_cuda
+            and routed_output.is_cuda
+            and token_indices.is_cuda
+            and scores.is_cuda
+            and base.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            routed_output = _lbt_wait_tensor(routed_output)
+            ctx.save_for_backward(token_indices, routed_output, scores)
+            saved_for_backward = True
+            routed_output_bf16 = _mxfp4_as_contiguous_dtype(routed_output, torch.bfloat16)
+            base_bf16 = _mxfp4_as_contiguous_dtype(base, torch.bfloat16)
+            if route_inverse is not None and int(top_k) > 0:
+                combine_add_fn = _get_mxfp4_moe_route_combine_add_fn()
+                if combine_add_fn is not None:
+                    try:
+                        out = torch.empty_like(base_bf16)
+                        combine_add_fn(
+                            routed_output_bf16,
+                            scores,
+                            _mxfp4_as_contiguous_dtype(route_inverse.reshape(-1), torch.int64),
+                            base_bf16,
+                            out,
+                            int(top_k),
+                        )
+                        return out
+                    except (AttributeError, FileNotFoundError, ImportError):
+                        pass
+            scale_scatter_fn = _get_mxfp4_moe_scale_scatter_add_fn()
+            if scale_scatter_fn is not None:
+                try:
+                    out = base_bf16.clone()
+                    scale_scatter_fn(routed_output_bf16, scores, token_indices, out)
+                    return out
+                except (AttributeError, FileNotFoundError, ImportError):
+                    pass
+
+        if not saved_for_backward:
+            ctx.save_for_backward(token_indices, routed_output, scores)
+        scaled_output = (
+            routed_output.to(torch.float32)
+            * scores.reshape(-1, 1)
+        ).to(base.dtype)
+        out = base.clone()
+        out.index_add_(0, token_indices, scaled_output)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        token_indices, routed_output, scores = ctx.saved_tensors
+        grad_base = grad_output
+
+        if (
+            _mxfp4_deepseek_tk_scored_fallback_combine_bwd()
+            and grad_output.is_cuda
+            and routed_output.is_cuda
+            and token_indices.is_cuda
+            and scores.is_cuda
+            and grad_output.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            grad_output = _lbt_wait_tensor(grad_output)
+            routed_output = _lbt_wait_tensor(routed_output)
+            fused_bwd_fn = _get_mxfp4_moe_indexed_scale_dot_rows_fn()
+            if fused_bwd_fn is not None:
+                try:
+                    grad_routed_output, grad_scores = fused_bwd_fn(
+                        _mxfp4_as_contiguous_dtype(grad_output, torch.bfloat16),
+                        token_indices,
+                        _mxfp4_as_contiguous_dtype(routed_output, torch.bfloat16),
+                        scores,
+                    )
+                    return (
+                        grad_base,
+                        None,
+                        grad_routed_output,
+                        grad_scores.to(ctx.score_dtype),
+                        None,
+                        None,
+                    )
+                except (AttributeError, FileNotFoundError, ImportError):
+                    pass
+
+        grad_selected = None
+        grad_selected_fp32 = None
+        grad_output_bf16 = None
+        routed_output_fp32 = None
+        grad_routed_output = None
+        scale_rows_fn = _get_mxfp4_moe_indexed_scale_rows_fn()
+
+        def _materialize_grad_output_bf16() -> torch.Tensor:
+            nonlocal grad_output_bf16
+            if grad_output_bf16 is None:
+                grad_output_bf16 = _mxfp4_as_contiguous_dtype(grad_output, torch.bfloat16)
+            return grad_output_bf16
+
+        if (
+            _mxfp4_deepseek_tk_indexed_scale_bwd()
+            and scale_rows_fn is not None
+            and grad_output.is_cuda
+            and token_indices.is_cuda
+            and scores.is_cuda
+            and grad_output.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            try:
+                grad_routed_output = scale_rows_fn(
+                    _materialize_grad_output_bf16(),
+                    token_indices,
+                    scores,
+                )
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                grad_routed_output = None
+
+        def _materialize_grad_selected_fp32() -> torch.Tensor:
+            nonlocal grad_selected, grad_selected_fp32
+            if grad_selected_fp32 is None:
+                grad_selected = grad_output.index_select(0, token_indices)
+                grad_selected_fp32 = grad_selected.to(torch.float32)
+            return grad_selected_fp32
+
+        if grad_routed_output is None:
+            grad_routed_output = (
+                _materialize_grad_selected_fp32() * scores.reshape(-1, 1)
+            ).to(routed_output.dtype)
+
+        def _materialize_routed_output_fp32() -> torch.Tensor:
+            nonlocal routed_output_fp32
+            if routed_output_fp32 is None:
+                routed_output_fp32 = routed_output.to(torch.float32)
+            return routed_output_fp32
+
+        dot_fn = _get_mxfp4_moe_indexed_dot_rows_fn()
+        if (
+            dot_fn is not None
+            and grad_output.is_cuda
+            and routed_output.is_cuda
+            and grad_output.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            try:
+                routed_output = _lbt_wait_tensor(routed_output)
+                grad_scores = dot_fn(
+                    _materialize_grad_output_bf16(),
+                    token_indices,
+                    _mxfp4_as_contiguous_dtype(routed_output, torch.bfloat16),
+                )
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                grad_scores = (
+                    _materialize_grad_selected_fp32()
+                    * _materialize_routed_output_fp32()
+                ).sum(dim=1)
+        else:
+            grad_scores = (
+                _materialize_grad_selected_fp32()
+                * _materialize_routed_output_fp32()
+            ).sum(dim=1)
+        return (
+            grad_base,
+            None,
+            grad_routed_output,
+            grad_scores.to(ctx.score_dtype),
+            None,
+            None,
+        )
 
 
 @dataclass
@@ -891,12 +1340,15 @@ class TokenReorderer(nn.Module):
 
         # Reorder the token indices to match the order of the experts
         # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(
+        route_positions_experts_sorted = torch.argsort(
             selected_experts_indices.view(-1), stable=True
         )
 
-        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
+        top_scores_experts_sorted = _mxfp4_gather_route_scores(
+            top_scores,
+            route_positions_experts_sorted,
+        )
+        token_indices_experts_sorted = route_positions_experts_sorted // self.top_k
 
         return (
             top_scores_experts_sorted,
@@ -910,29 +1362,47 @@ class TokenReorderer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
             os.environ.get("MXFP4_DEEPSEEK_TK_ROUTE_REORDER", "1") != "0"
+            and _mxfp4_deepseek_can_use_tk_route_producer()
             and selected_experts_indices.is_cuda
             and selected_experts_indices.dtype == torch.int64
         ):
             reorder_fn = _get_mxfp4_moe_reorder_fn()
             if reorder_fn is not None:
                 try:
-                    return reorder_fn(
+                    out = reorder_fn(
                         selected_experts_indices.contiguous(),
                         self.num_experts,
                         self.top_k,
                     )
+                    routes = int(out[0].numel())
+                    _lbt_validate_ep_route_counts(out[1], routes)
+                    if (
+                        _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+                        and _mxfp4_deepseek_validate_tk_ep_route()
+                        and not _lbt_route_positions_are_permutation(out[2], routes)
+                    ):
+                        raise RuntimeError("TK route producer positions are unsafe under EP")
+                    return out
                 except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                    _lbt_sync_unsafe_tk_route(selected_experts_indices)
                     pass
 
+        return self.forward_with_route_positions_no_scores_torch(selected_experts_indices)
+
+    def forward_with_route_positions_no_scores_torch(
+        self,
+        selected_experts_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        selected_experts_indices_flat = selected_experts_indices.reshape(-1)
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+            selected_experts_indices_flat,
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
         )
 
         route_positions_experts_sorted = torch.argsort(
-            selected_experts_indices.view(-1), stable=True
+            selected_experts_indices_flat, stable=True
         )
         token_indices_experts_sorted = route_positions_experts_sorted // self.top_k
 
@@ -952,7 +1422,10 @@ class TokenReorderer(nn.Module):
             num_tokens_per_expert,
             route_positions_experts_sorted,
         ) = self.forward_with_route_positions_no_scores(selected_experts_indices)
-        top_scores_experts_sorted = top_scores.view(-1)[route_positions_experts_sorted]
+        top_scores_experts_sorted = _mxfp4_gather_route_scores(
+            top_scores,
+            route_positions_experts_sorted,
+        )
 
         return (
             top_scores_experts_sorted,
@@ -1032,7 +1505,10 @@ class TokenReorderer(nn.Module):
             route_positions_experts_sorted,
         ) = self.forward_debug_force_load_balance_no_scores(top_scores)
 
-        top_scores_experts_sorted = top_scores.reshape(-1)[route_positions_experts_sorted]
+        top_scores_experts_sorted = _mxfp4_gather_route_scores(
+            top_scores,
+            route_positions_experts_sorted,
+        )
 
         return (
             top_scores_experts_sorted,
@@ -1214,8 +1690,22 @@ class MoE(nn.Module):
                     self.reorderer.top_k,
                     _mxfp4_deepseek_grouped_m_granularity(),
                 )
+                _lbt_validate_ep_route_counts(
+                    num_tokens_per_expert,
+                    int(token_indices_experts_sorted.numel()),
+                )
+                if (
+                    _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+                    and _mxfp4_deepseek_validate_tk_ep_route()
+                    and not _lbt_route_positions_are_permutation(
+                        route_positions_experts_sorted,
+                        int(token_indices_experts_sorted.numel()),
+                    )
+                ):
+                    raise RuntimeError("TK route producer positions are unsafe under EP")
                 route_full_producer_used = True
             except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                _lbt_sync_unsafe_tk_route(selected_experts_indices)
                 route_full_producer_used = False
         if route_full_producer_used:
             pass
@@ -1245,13 +1735,143 @@ class MoE(nn.Module):
                 num_tokens_per_expert,
                 route_positions_experts_sorted,
             ) = self.reorderer.forward_with_route_positions(top_scores, selected_experts_indices)
+        elif _mxfp4_deepseek_route_scores_full_fallback():
+            try:
+                (
+                    top_scores_experts_sorted,
+                    token_indices_experts_sorted,
+                    num_tokens_per_expert,
+                    route_positions_experts_sorted,
+                    route_inverse_experts_sorted,
+                    route_inverse_padded_experts_sorted,
+                ) = _MXFP4MoERouteScoresFunction.apply(
+                    top_scores,
+                    selected_experts_indices,
+                    self.reorderer.num_experts,
+                    self.reorderer.top_k,
+                    _mxfp4_deepseek_grouped_m_granularity(),
+                )
+                _lbt_validate_ep_route_counts(
+                    num_tokens_per_expert,
+                    int(token_indices_experts_sorted.numel()),
+                )
+                if (
+                    _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+                    and _mxfp4_deepseek_validate_tk_ep_route()
+                    and not _lbt_route_positions_are_permutation(
+                        route_positions_experts_sorted,
+                        int(token_indices_experts_sorted.numel()),
+                    )
+                ):
+                    raise RuntimeError("TK route producer positions are unsafe under EP")
+                route_full_producer_used = True
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                _lbt_sync_unsafe_tk_route(selected_experts_indices)
+                (
+                    top_scores_experts_sorted,
+                    token_indices_experts_sorted,
+                    num_tokens_per_expert,
+                ) = self.reorderer(top_scores, selected_experts_indices)
+                route_positions_experts_sorted = None
         else:
+            if _mxfp4_deepseek_tk_route_inverse_fallback_combine():
+                (
+                    top_scores_experts_sorted,
+                    token_indices_experts_sorted,
+                    num_tokens_per_expert,
+                    route_positions_experts_sorted,
+                ) = self.reorderer.forward_with_route_positions(
+                    top_scores,
+                    selected_experts_indices,
+                )
+            else:
+                (
+                    top_scores_experts_sorted,
+                    token_indices_experts_sorted,
+                    num_tokens_per_expert,
+                ) = self.reorderer(top_scores, selected_experts_indices)
+                route_positions_experts_sorted = None
+
+        route_metadata_maybe_unsafe = route_full_producer_used or (
+            _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+            and route_positions_experts_sorted is not None
+        )
+        if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
+            with torch.no_grad():
+                print(
+                    "[lbt_moe_route_metadata]"
+                    f" rank={_lbt_dist_rank()}"
+                    f" world={_lbt_dist_world_size()}"
+                    f" unsafe={int(_mxfp4_deepseek_allow_unsafe_tk_ep_route())}"
+                    f" maybe_unsafe={int(route_metadata_maybe_unsafe)}"
+                    f" full={int(route_full_producer_used)}"
+                    f" route_pos={int(route_positions_experts_sorted is not None)}"
+                    f" routes={int(token_indices_experts_sorted.reshape(-1).numel())}"
+                    f" selected={int(selected_experts_indices.reshape(-1).numel())}"
+                    f" count_dtype={num_tokens_per_expert.dtype}"
+                    f" count_sum={int(num_tokens_per_expert.to(torch.int64).sum().item())}",
+                    flush=True,
+                )
+        route_count = int(token_indices_experts_sorted.reshape(-1).numel())
+        route_metadata_valid = True
+        if route_metadata_maybe_unsafe and _mxfp4_deepseek_validate_tk_ep_route():
+            route_metadata_valid = _lbt_ep_route_counts_match(
+                num_tokens_per_expert,
+                route_count,
+            ) and (
+                not _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+                or route_positions_experts_sorted is None
+                or _lbt_route_positions_are_permutation(
+                    route_positions_experts_sorted,
+                    route_count,
+                )
+            )
+        if route_metadata_maybe_unsafe and not route_metadata_valid:
+            _lbt_sync_unsafe_tk_route(selected_experts_indices)
             (
-                top_scores_experts_sorted,
                 token_indices_experts_sorted,
                 num_tokens_per_expert,
-            ) = self.reorderer(top_scores, selected_experts_indices)
-            route_positions_experts_sorted = None
+                route_positions_experts_sorted,
+            ) = self.reorderer.forward_with_route_positions_no_scores_torch(
+                selected_experts_indices
+            )
+            top_scores_experts_sorted = None
+            route_inverse_experts_sorted = None
+            route_inverse_padded_experts_sorted = None
+            route_full_producer_used = False
+            if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
+                with torch.no_grad():
+                    print(
+                        "[lbt_moe_route_metadata]"
+                        f" rank={_lbt_dist_rank()}"
+                        " fallback=1"
+                        f" routes={int(token_indices_experts_sorted.reshape(-1).numel())}"
+                        f" count_sum={int(num_tokens_per_expert.to(torch.int64).sum().item())}",
+                        flush=True,
+                    )
+
+        if (
+            route_metadata_maybe_unsafe
+            and _mxfp4_deepseek_allow_unsafe_tk_ep_route()
+        ):
+            num_tokens_per_expert = num_tokens_per_expert.to(torch.int64).clone()
+
+        if (
+            route_inverse_experts_sorted is None
+            and route_positions_experts_sorted is not None
+            and _mxfp4_deepseek_tk_route_inverse_fallback_combine()
+        ):
+            build_inverse_fn = _get_mxfp4_moe_build_route_inverse_fn()
+            if build_inverse_fn is not None:
+                try:
+                    route_inverse_experts_sorted = build_inverse_fn(
+                        _mxfp4_as_contiguous_dtype(
+                            route_positions_experts_sorted.reshape(-1),
+                            torch.int64,
+                        )
+                    )
+                except (AttributeError, FileNotFoundError, ImportError):
+                    route_inverse_experts_sorted = None
 
         if skip_router_histc:
             with torch.no_grad():
@@ -1267,7 +1887,10 @@ class MoE(nn.Module):
 
         if fused_moe_combine_with_shared is not None:
             if top_scores_experts_sorted is None:
-                top_scores_experts_sorted = top_scores.reshape(-1)[route_positions_experts_sorted]
+                top_scores_experts_sorted = _mxfp4_gather_route_scores(
+                    top_scores,
+                    route_positions_experts_sorted,
+                )
             fused_out = fused_moe_combine_with_shared(
                 x,
                 self.shared_experts,
@@ -1312,7 +1935,10 @@ class MoE(nn.Module):
 
         if fused_moe_combine is not None:
             if top_scores_experts_sorted is None:
-                top_scores_experts_sorted = top_scores.reshape(-1)[route_positions_experts_sorted]
+                top_scores_experts_sorted = _mxfp4_gather_route_scores(
+                    top_scores,
+                    route_positions_experts_sorted,
+                )
             fused_out = fused_moe_combine(
                 x,
                 top_scores_experts_sorted,
@@ -1334,19 +1960,44 @@ class MoE(nn.Module):
                     )
                 return fused_out.reshape(bs, slen, dim)
 
-        # shape (bs*slen*top_k, dim)
-        token_indices_experts_sorted = token_indices_experts_sorted.reshape(
-            -1, 1
-        ).expand(-1, dim)
+        use_indexed_fallback_combine = _mxfp4_deepseek_indexed_fallback_combine()
+        if use_indexed_fallback_combine:
+            # shape (bs*slen*top_k)
+            token_indices_experts_sorted = token_indices_experts_sorted.reshape(-1)
 
-        # shape (bs*slen*top_k, dim)
-        routed_input = torch.gather(x, dim=0, index=token_indices_experts_sorted)
+            # shape (bs*slen*top_k, dim)
+            routed_input = x.index_select(dim=0, index=token_indices_experts_sorted)
+        else:
+            # shape (bs*slen*top_k, dim)
+            token_indices_experts_sorted = token_indices_experts_sorted.reshape(
+                -1, 1
+            ).expand(-1, dim)
+
+            # shape (bs*slen*top_k, dim)
+            routed_input = torch.gather(
+                x,
+                dim=0,
+                index=token_indices_experts_sorted,
+            )
 
         if self.score_before_experts:
             routed_input = (
                 routed_input.to(torch.float32)
                 * top_scores_experts_sorted.reshape(-1, 1)
             ).to(x.dtype)
+
+        if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
+            with torch.no_grad():
+                print(
+                    "[lbt_moe_route_metadata]"
+                    f" rank={_lbt_dist_rank()}"
+                    " pre_experts=1"
+                    f" routed_rows={int(routed_input.shape[0])}"
+                    f" count_dtype={num_tokens_per_expert.dtype}"
+                    f" count_sum={int(num_tokens_per_expert.to(torch.int64).sum().item())}"
+                    f" counts={num_tokens_per_expert.to(torch.int64).tolist()}",
+                    flush=True,
+                )
 
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
@@ -1359,15 +2010,37 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x)
 
-        if not self.score_before_experts:
-            routed_output = (
-                routed_output.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
-
-        out = out.scatter_add(
-            dim=0, index=token_indices_experts_sorted, src=routed_output
-        )
+        if (
+            use_indexed_fallback_combine
+            and not self.score_before_experts
+            and _mxfp4_deepseek_scored_indexed_fallback_combine()
+        ):
+            out = _MoEScoredIndexCombineFunction.apply(
+                out,
+                token_indices_experts_sorted,
+                routed_output,
+                top_scores_experts_sorted,
+                route_inverse_experts_sorted,
+                self.reorderer.top_k,
+            )
+        else:
+            if not self.score_before_experts:
+                routed_output = (
+                    routed_output.to(torch.float32)
+                    * top_scores_experts_sorted.reshape(-1, 1)
+                ).to(x.dtype)
+            if use_indexed_fallback_combine:
+                out = _MoEIndexCombineFunction.apply(
+                    out,
+                    token_indices_experts_sorted,
+                    routed_output,
+                )
+            else:
+                out = out.scatter_add(
+                    dim=0,
+                    index=token_indices_experts_sorted,
+                    src=routed_output,
+                )
         out = out.reshape(bs, slen, dim)
         if forward_debug_enabled:
             _lbt_moe_forward_debug(

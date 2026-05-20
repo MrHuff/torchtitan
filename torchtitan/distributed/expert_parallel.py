@@ -43,6 +43,10 @@ def _lbt_ep_debug_split_limit() -> int:
         return 32
 
 
+def _lbt_ep_split_count_all_gather() -> bool:
+    return _lbt_env_flag("LBT_EP_SPLIT_COUNT_ALL_GATHER", False)
+
+
 def _lbt_split_stats(splits: list[int]) -> tuple[int, int, float]:
     if not splits:
         return 0, 0, 0.0
@@ -336,6 +340,27 @@ class ExpertParallel(ParallelStyle):
     def _token_dispatch(self, mod, inputs, device_mesh):
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
+        if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
+            with torch.no_grad():
+                counts_debug = num_tokens_per_expert
+                to_local = getattr(counts_debug, "to_local", None)
+                if to_local is not None:
+                    try:
+                        counts_debug = to_local()
+                    except Exception:
+                        pass
+                counts_debug_i64 = counts_debug.to(torch.int64)
+                print(
+                    "[lbt_ep_counts]"
+                    f" rank={torch.distributed.get_rank()}"
+                    f" type={type(num_tokens_per_expert).__name__}"
+                    f" is_dtensor={int(isinstance(num_tokens_per_expert, DTensor))}"
+                    f" shape={tuple(num_tokens_per_expert.shape)}"
+                    f" local_shape={tuple(counts_debug_i64.shape)}"
+                    f" sum={int(counts_debug_i64.sum().item())}"
+                    f" counts={counts_debug_i64.tolist()}",
+                    flush=True,
+                )
         if num_tokens_per_expert.dtype not in (torch.int32, torch.int64):
             num_tokens_per_expert = num_tokens_per_expert.to(torch.int64)
         ep_degree = device_mesh.shape[0]
@@ -343,30 +368,47 @@ class ExpertParallel(ParallelStyle):
 
         # generate the input splits and output splits for all-to-all
         with torch.no_grad():
-            num_tokens_per_expert_group = all_to_all_single(
-                num_tokens_per_expert,
-                None,
-                None,
-                group=device_mesh.get_group(),
+            input_split_sizes = num_tokens_per_expert.view(ep_degree, -1).sum(dim=1)
+            if _lbt_ep_split_count_all_gather():
+                gathered_counts = torch.empty(
+                    ep_degree * num_tokens_per_expert.numel(),
+                    device=num_tokens_per_expert.device,
+                    dtype=num_tokens_per_expert.dtype,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    gathered_counts,
+                    num_tokens_per_expert.contiguous(),
+                    group=device_mesh.get_group(),
+                )
+                gathered_counts = gathered_counts.view(ep_degree, -1)
+                local_expert_start = device_mesh.get_local_rank() * num_local_experts
+                num_tokens_per_expert_group = gathered_counts[
+                    :,
+                    local_expert_start : local_expert_start + num_local_experts,
+                ].reshape(-1)
+            else:
+                num_tokens_per_expert_group = all_to_all_single(
+                    num_tokens_per_expert,
+                    None,
+                    None,
+                    group=device_mesh.get_group(),
+                )
+                # Need to wait explicitly because it is used by a triton kernel later
+                # which doesn't realize that AsyncCollectiveTensor needs unwrapping
+                num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
+                    num_tokens_per_expert_group
+                )
+            split_sizes = torch.stack(
+                (
+                    input_split_sizes,
+                    num_tokens_per_expert_group.view(ep_degree, -1).sum(dim=1),
+                )
             )
-            # Need to wait explicitly because it is used by a triton kernel later
-            # which doesn't realize that AsyncCollectiveTensor needs unwrapping
-            num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
-                num_tokens_per_expert_group
-            )
-            input_splits = (
-                num_tokens_per_expert.view(ep_degree, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=True)
-            )
-            # NOTE: this would incur a device-to-host sync
-            output_splits = (
-                num_tokens_per_expert_group.view(ep_degree, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=False)
-            )
-            self.input_splits = input_splits.tolist()
-            self.output_splits = output_splits.tolist()
+            # all_to_all_single requires host split lists. Copy both directions
+            # together so each MoE layer pays one small D2H sync instead of two.
+            split_sizes_cpu = split_sizes.to(torch.device("cpu"), non_blocking=False)
+            self.input_splits = split_sizes_cpu[0].tolist()
+            self.output_splits = split_sizes_cpu[1].tolist()
 
         _lbt_debug_ep_splits(
             "dispatch",
