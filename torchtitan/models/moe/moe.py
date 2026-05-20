@@ -455,6 +455,14 @@ def _mxfp4_deepseek_route_scores_full_producer(num_experts: int) -> bool:
     return int(num_experts) <= 16
 
 
+def _mxfp4_as_contiguous_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    return tensor
+
+
 class _MXFP4MoERouteScoresFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -468,8 +476,8 @@ class _MXFP4MoERouteScoresFunction(torch.autograd.Function):
         fn = _get_mxfp4_moe_reorder_scores_full_fn()
         if fn is None:
             raise AttributeError("mxfp4_moe_reorder_scores_full unavailable")
-        flat_scores = top_scores.reshape(-1).to(dtype=torch.float32).contiguous()
-        selected = selected_experts_indices.to(dtype=torch.int64).contiguous()
+        flat_scores = _mxfp4_as_contiguous_dtype(top_scores.reshape(-1), torch.float32)
+        selected = _mxfp4_as_contiguous_dtype(selected_experts_indices, torch.int64)
         (
             sorted_scores,
             token_indices,
@@ -494,10 +502,10 @@ class _MXFP4MoERouteScoresFunction(torch.autograd.Function):
                 device=grad_sorted_scores.device,
                 dtype=torch.float32,
             )
-            grad_flat[route_positions] = grad_sorted_scores.to(dtype=torch.float32).contiguous()
+            grad_flat[route_positions] = _mxfp4_as_contiguous_dtype(grad_sorted_scores, torch.float32)
         else:
             grad_flat = scatter_fn(
-                grad_sorted_scores.to(dtype=torch.float32).contiguous(),
+                _mxfp4_as_contiguous_dtype(grad_sorted_scores, torch.float32),
                 route_positions,
                 ctx.num_scores,
             )
