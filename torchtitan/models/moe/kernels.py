@@ -144,6 +144,7 @@ def generate_permute_indices(
     max_len: int,
     alignment: int,
     use_cpu: bool = False,
+    m_sizes: torch.Tensor | None = None,
 ):
     """
     Prepare permutation indices and the number of tokens for each expert.
@@ -174,16 +175,19 @@ def generate_permute_indices(
         torch.cumsum(tokens_per_expert_group, 0) - tokens_per_expert_group
     )
 
-    # total tokens for each expert (sum over ranks)
-    total_tokens_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0)
+    if m_sizes is None:
+        # total tokens for each expert (sum over ranks)
+        total_tokens_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0)
 
-    # pad out empty experts to alignment requirement
-    total_tokens_per_expert = torch.clamp_min(total_tokens_per_expert, alignment)
+        # pad out empty experts to alignment requirement
+        total_tokens_per_expert = torch.clamp_min(total_tokens_per_expert, alignment)
 
-    # align the chunk sizes (cdiv)
-    m_sizes = ((total_tokens_per_expert + alignment - 1) // alignment * alignment).to(
-        torch.int32
-    )
+        # align the chunk sizes (cdiv)
+        m_sizes = ((total_tokens_per_expert + alignment - 1) // alignment * alignment).to(
+            torch.int32
+        )
+    elif m_sizes.dtype != torch.int32:
+        m_sizes = m_sizes.to(torch.int32)
 
     # additional prefix sum to get write offset of each expert in permuted_indices
     # write offsets is per local expert, not global

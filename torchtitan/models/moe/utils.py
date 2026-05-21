@@ -39,7 +39,13 @@ def set_token_group_alignment_size_m(
     TOKEN_GROUP_ALIGN_SIZE_M = alignment_size
 
 
-def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
+def _permute(
+    x,
+    num_tokens_per_expert,
+    ep_degree,
+    num_local_experts,
+    precomputed_m_sizes=None,
+):
     global TOKEN_GROUP_ALIGN_SIZE_M
     x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
     padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
@@ -50,6 +56,7 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
             ep_degree,
             padded_max_len,
             TOKEN_GROUP_ALIGN_SIZE_M,
+            m_sizes=precomputed_m_sizes,
         )
 
     x = torch.vstack((x, x.new_zeros((x.shape[-1]))))

@@ -411,6 +411,7 @@ class ExpertParallel(ParallelStyle):
             local_expert_counts = (
                 (local_expert_counts + alignment - 1) // alignment * alignment
             )
+            local_expert_counts_i32 = local_expert_counts.to(torch.int32)
             # all_to_all_single requires host split lists. Copy dispatch splits
             # and the post-permute local expert counts together so downstream
             # grouped experts do not pay another tiny D2H synchronization.
@@ -458,7 +459,11 @@ class ExpertParallel(ParallelStyle):
             self.permuted_indices,
             num_tokens_per_expert_group,
         ) = _permute(
-            routed_input, num_tokens_per_expert_group, ep_degree, num_local_experts
+            routed_input,
+            num_tokens_per_expert_group,
+            ep_degree,
+            num_local_experts,
+            local_expert_counts_i32,
         )
         try:
             num_tokens_per_expert_group._lbt_counts_list = local_expert_counts_list
