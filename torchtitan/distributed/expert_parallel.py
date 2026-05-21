@@ -23,6 +23,7 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.parallel import ParallelStyle
 
+from torchtitan.models.moe import utils as moe_utils
 from torchtitan.models.moe.utils import _permute, _unpermute
 
 
@@ -404,11 +405,24 @@ class ExpertParallel(ParallelStyle):
                     num_tokens_per_expert_group.view(ep_degree, -1).sum(dim=1),
                 )
             )
-            # all_to_all_single requires host split lists. Copy both directions
-            # together so each MoE layer pays one small D2H sync instead of two.
-            split_sizes_cpu = split_sizes.to(torch.device("cpu"), non_blocking=False)
-            self.input_splits = split_sizes_cpu[0].tolist()
-            self.output_splits = split_sizes_cpu[1].tolist()
+            alignment = int(moe_utils.TOKEN_GROUP_ALIGN_SIZE_M)
+            local_expert_counts = num_tokens_per_expert_group.view(ep_degree, -1).sum(dim=0)
+            local_expert_counts = torch.clamp_min(local_expert_counts, alignment)
+            local_expert_counts = (
+                (local_expert_counts + alignment - 1) // alignment * alignment
+            )
+            # all_to_all_single requires host split lists. Copy dispatch splits
+            # and the post-permute local expert counts together so downstream
+            # grouped experts do not pay another tiny D2H synchronization.
+            host_sizes = torch.cat(
+                (
+                    split_sizes.reshape(-1).to(torch.int64),
+                    local_expert_counts.reshape(-1).to(torch.int64),
+                )
+            ).to(torch.device("cpu"), non_blocking=False)
+            self.input_splits = host_sizes[:ep_degree].tolist()
+            self.output_splits = host_sizes[ep_degree : 2 * ep_degree].tolist()
+            local_expert_counts_list = host_sizes[2 * ep_degree :].tolist()
 
         _lbt_debug_ep_splits(
             "dispatch",
@@ -446,6 +460,10 @@ class ExpertParallel(ParallelStyle):
         ) = _permute(
             routed_input, num_tokens_per_expert_group, ep_degree, num_local_experts
         )
+        try:
+            num_tokens_per_expert_group._lbt_counts_list = local_expert_counts_list
+        except Exception:
+            pass
 
         return routed_input, num_tokens_per_expert_group
 
