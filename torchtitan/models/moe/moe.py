@@ -18,6 +18,8 @@ from .utils import indices_padding_wrapper
 _MXFP4_MOE_REORDER_FN = None
 _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
 _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN = None
+_MXFP4_MOE_EP2_SELECT_TOP3_BALANCE_SCORES_FN = None
+_MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN = None
 _MXFP4_MOE_GATHER_SCORES_FN = None
 _MXFP4_MOE_SCATTER_SCORES_FN = None
 _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
@@ -424,6 +426,16 @@ def _get_mxfp4_moe_ep2_balance_top3_routes_fn():
     return _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN
 
 
+def _get_mxfp4_moe_ep2_select_top3_balance_scores_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_EP2_SELECT_TOP3_BALANCE_SCORES_FN
+
+
+def _get_mxfp4_moe_ep2_scatter_top3_scores_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN
+
+
 def _get_mxfp4_moe_scatter_scores_fn():
     _ensure_mxfp4_moe_route_imports()
     return _MXFP4_MOE_SCATTER_SCORES_FN
@@ -467,6 +479,8 @@ def _get_mxfp4_moe_indexed_scale_rows_fn():
 def _ensure_mxfp4_moe_route_imports():
     global _MXFP4_MOE_REORDER_FN, _MXFP4_MOE_REORDER_SCORES_FULL_FN
     global _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN
+    global _MXFP4_MOE_EP2_SELECT_TOP3_BALANCE_SCORES_FN
+    global _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN
     global _MXFP4_MOE_GATHER_SCORES_FN, _MXFP4_MOE_SCATTER_SCORES_FN
     global _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN
     global _MXFP4_MOE_ROUTE_COMBINE_ADD_FN, _MXFP4_MOE_SCALE_SCATTER_ADD_FN
@@ -482,6 +496,8 @@ def _ensure_mxfp4_moe_route_imports():
         _MXFP4_MOE_REORDER_FN = None
         _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
         _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN = None
+        _MXFP4_MOE_EP2_SELECT_TOP3_BALANCE_SCORES_FN = None
+        _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN = None
         _MXFP4_MOE_GATHER_SCORES_FN = None
         _MXFP4_MOE_SCATTER_SCORES_FN = None
         _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
@@ -497,6 +513,12 @@ def _ensure_mxfp4_moe_route_imports():
         )
         _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN = getattr(
             mxfp4_backend, "mxfp4_moe_ep2_balance_top3_routes", None
+        )
+        _MXFP4_MOE_EP2_SELECT_TOP3_BALANCE_SCORES_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_ep2_select_top3_balance_scores", None
+        )
+        _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_ep2_scatter_top3_scores", None
         )
         _MXFP4_MOE_GATHER_SCORES_FN = getattr(mxfp4_backend, "mxfp4_moe_gather_scores", None)
         _MXFP4_MOE_SCATTER_SCORES_FN = getattr(mxfp4_backend, "mxfp4_moe_scatter_scores", None)
@@ -583,6 +605,10 @@ def _mxfp4_deepseek_tk_scored_route_inverse_combine() -> bool:
 
 def _mxfp4_deepseek_tk_ep2_balance_routes() -> bool:
     return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_BALANCE_ROUTES", True)
+
+
+def _mxfp4_deepseek_tk_ep2_select_top3() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_SELECT_TOP3", True)
 
 
 def _mxfp4_deepseek_tk_indexed_scale_bwd() -> bool:
@@ -757,6 +783,64 @@ class _MXFP4MoEScoreGatherFunction(torch.autograd.Function):
                 )
                 grad_flat[route_positions] = grad_sorted_scores
         return grad_flat.reshape(ctx.orig_shape).to(ctx.score_dtype), None
+
+
+class _MXFP4MoEEP2SelectTop3BalanceFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        scores: torch.Tensor,
+        expert_bias: torch.Tensor | None,
+        experts_per_group: int,
+    ):
+        fn = _get_mxfp4_moe_ep2_select_top3_balance_scores_fn()
+        if fn is None:
+            raise AttributeError("mxfp4_moe_ep2_select_top3_balance_scores unavailable")
+        scores_f32 = _mxfp4_as_contiguous_dtype(scores, torch.float32)
+        if expert_bias is None:
+            bias = scores_f32.new_empty((0,))
+        else:
+            bias = _mxfp4_as_contiguous_dtype(expert_bias, torch.float32)
+        top_scores, selected_experts_indices = fn(
+            scores_f32,
+            bias,
+            int(experts_per_group),
+        )
+        ctx.orig_shape = tuple(scores.shape)
+        ctx.score_dtype = scores.dtype
+        ctx.save_for_backward(selected_experts_indices)
+        ctx.mark_non_differentiable(selected_experts_indices)
+        return top_scores.to(scores.dtype), selected_experts_indices
+
+    @staticmethod
+    def backward(ctx, grad_top_scores: torch.Tensor, _grad_selected=None):
+        (selected_experts_indices,) = ctx.saved_tensors
+        grad_scores = None
+        if ctx.needs_input_grad[0]:
+            grad_top_scores = _mxfp4_as_contiguous_dtype(grad_top_scores, torch.float32)
+            scatter_fn = _get_mxfp4_moe_ep2_scatter_top3_scores_fn()
+            if scatter_fn is not None:
+                try:
+                    grad_scores = scatter_fn(
+                        grad_top_scores,
+                        selected_experts_indices,
+                        int(ctx.orig_shape[1]),
+                    )
+                except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                    grad_scores = None
+            if grad_scores is None:
+                grad_scores = torch.zeros(
+                    ctx.orig_shape,
+                    device=grad_top_scores.device,
+                    dtype=torch.float32,
+                )
+                grad_scores.scatter_add_(
+                    1,
+                    selected_experts_indices,
+                    grad_top_scores,
+                )
+            grad_scores = grad_scores.to(ctx.score_dtype)
+        return grad_scores, None, None
 
 
 def _mxfp4_gather_route_scores(
@@ -1412,6 +1496,43 @@ class TokenChoiceTopKRouter(nn.Module):
         selected_experts_indices[:, -1] = replacement
         return selected_experts_indices
 
+    def _try_mxfp4_ep2_select_top3_balance(
+        self,
+        scores: torch.Tensor,
+        expert_bias: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        bias = _lbt_local_tensor(expert_bias) if expert_bias is not None else None
+        if (
+            not _mxfp4_deepseek_tk_ep2_select_top3()
+            or self.top_k != 3
+            or self._ep_route_coverage_degree() != 2
+            or self._ep_route_coverage_mode() not in ("balanced_fast", "fast_balanced")
+            or not scores.is_cuda
+            or scores.dtype != torch.float32
+            or scores.dim() != 2
+            or self.num_experts % 2 != 0
+            or (
+                bias is not None
+                and (
+                    not bias.is_cuda
+                    or bias.device != scores.device
+                    or bias.dim() != 1
+                    or bias.numel() != self.num_experts
+                )
+            )
+        ):
+            return None
+        if _get_mxfp4_moe_ep2_select_top3_balance_scores_fn() is None:
+            return None
+        try:
+            return _MXFP4MoEEP2SelectTop3BalanceFunction.apply(
+                scores,
+                bias,
+                self.num_experts // 2,
+            )
+        except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+            return None
+
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1450,33 +1571,41 @@ class TokenChoiceTopKRouter(nn.Module):
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
         elif expert_bias is not None:
-            route_scores = scores + expert_bias
-            if self._ep_route_coverage_degree() == 2 and self._use_striped_ep_route_coverage():
-                selected_experts_indices = self._select_striped_ep_route_coverage(route_scores)
+            fused_route = self._try_mxfp4_ep2_select_top3_balance(scores, expert_bias)
+            if fused_route is not None:
+                top_scores, selected_experts_indices = fused_route
             else:
-                _, selected_experts_indices = torch.topk(
-                    route_scores, k=self.top_k, dim=1
-                )
-                selected_experts_indices = self._apply_ep_route_coverage(
-                    route_scores,
-                    selected_experts_indices,
-                )
-            top_scores = scores.gather(dim=1, index=selected_experts_indices)
+                route_scores = scores + expert_bias
+                if self._ep_route_coverage_degree() == 2 and self._use_striped_ep_route_coverage():
+                    selected_experts_indices = self._select_striped_ep_route_coverage(route_scores)
+                else:
+                    _, selected_experts_indices = torch.topk(
+                        route_scores, k=self.top_k, dim=1
+                    )
+                    selected_experts_indices = self._apply_ep_route_coverage(
+                        route_scores,
+                        selected_experts_indices,
+                    )
+                top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
             if self._ep_route_coverage_degree() == 2 and self._use_striped_ep_route_coverage():
                 selected_experts_indices = self._select_striped_ep_route_coverage(scores)
                 top_scores = scores.gather(dim=1, index=selected_experts_indices)
             else:
-                top_scores, selected_experts_indices = torch.topk(
-                    scores, k=self.top_k, dim=1
-                )
-                covered_selected_experts_indices = self._apply_ep_route_coverage(
-                    scores,
-                    selected_experts_indices,
-                )
-                if covered_selected_experts_indices is not selected_experts_indices:
-                    selected_experts_indices = covered_selected_experts_indices
-                    top_scores = scores.gather(dim=1, index=selected_experts_indices)
+                fused_route = self._try_mxfp4_ep2_select_top3_balance(scores, None)
+                if fused_route is not None:
+                    top_scores, selected_experts_indices = fused_route
+                else:
+                    top_scores, selected_experts_indices = torch.topk(
+                        scores, k=self.top_k, dim=1
+                    )
+                    covered_selected_experts_indices = self._apply_ep_route_coverage(
+                        scores,
+                        selected_experts_indices,
+                    )
+                    if covered_selected_experts_indices is not selected_experts_indices:
+                        selected_experts_indices = covered_selected_experts_indices
+                        top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
         if "LBT_MOE_ROUTER_DEBUG" in os.environ:
             _lbt_moe_router_debug(
@@ -1491,7 +1620,8 @@ class TokenChoiceTopKRouter(nn.Module):
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
-        top_scores = top_scores * self.route_scale
+        if self.route_scale != 1.0:
+            top_scores = top_scores * self.route_scale
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         if self._debug_force_load_balance:
