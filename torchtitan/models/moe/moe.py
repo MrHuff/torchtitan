@@ -1204,6 +1204,39 @@ class TokenChoiceTopKRouter(nn.Module):
         self._debug_force_load_balance_counts_cache[cache_key] = counts
         return counts
 
+    def _apply_ep_route_coverage(
+        self,
+        route_scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if not _lbt_env_flag("LBT_MOE_EP_ROUTE_COVERAGE"):
+            return selected_experts_indices
+        ep_degree = _lbt_env_int("LBT_MOE_EP_ROUTE_COVERAGE_DEGREE", 0)
+        if ep_degree != 2 or self.top_k < ep_degree:
+            return selected_experts_indices
+        if self.num_experts % ep_degree != 0:
+            return selected_experts_indices
+
+        experts_per_group = self.num_experts // ep_degree
+        selected_groups = selected_experts_indices // experts_per_group
+        missing_group0 = (selected_groups == 1).all(dim=1)
+        missing_group1 = (selected_groups == 0).all(dim=1)
+
+        selected_experts_indices = selected_experts_indices.clone()
+        best_group0 = torch.argmax(route_scores[:, :experts_per_group], dim=1)
+        best_group1 = (
+            torch.argmax(route_scores[:, experts_per_group:], dim=1)
+            + experts_per_group
+        )
+        replacement = torch.where(
+            missing_group0,
+            best_group0,
+            selected_experts_indices[:, -1],
+        )
+        replacement = torch.where(missing_group1, best_group1, replacement)
+        selected_experts_indices[:, -1] = replacement
+        return selected_experts_indices
+
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1242,14 +1275,26 @@ class TokenChoiceTopKRouter(nn.Module):
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
         elif expert_bias is not None:
+            route_scores = scores + expert_bias
             _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=1
+                route_scores, k=self.top_k, dim=1
+            )
+            selected_experts_indices = self._apply_ep_route_coverage(
+                route_scores,
+                selected_experts_indices,
             )
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
             top_scores, selected_experts_indices = torch.topk(
                 scores, k=self.top_k, dim=1
             )
+            covered_selected_experts_indices = self._apply_ep_route_coverage(
+                scores,
+                selected_experts_indices,
+            )
+            if covered_selected_experts_indices is not selected_experts_indices:
+                selected_experts_indices = covered_selected_experts_indices
+                top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
         if "LBT_MOE_ROUTER_DEBUG" in os.environ:
             _lbt_moe_router_debug(
