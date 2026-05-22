@@ -97,6 +97,10 @@ def _lbt_should_compress_a2a_tensor(tensor: torch.Tensor) -> bool:
     return min_bytes == 0 or tensor.numel() * tensor.element_size() >= min_bytes
 
 
+def _lbt_ep_a2a_custom_autograd_below_threshold() -> bool:
+    return _lbt_env_flag("LBT_EP_A2A_CUSTOM_AUTOGRAD_BELOW_THRESHOLD", True)
+
+
 def _lbt_fp8_dtype(mode: str) -> torch.dtype:
     if mode == "fp8_e4m3":
         return torch.float8_e4m3fn
@@ -263,7 +267,23 @@ def _lbt_all_to_all_single_autograd(
     group,
 ) -> torch.Tensor:
     forward_mode = _lbt_ep_a2a_mode()
-    if forward_mode == "none" or not _lbt_should_compress_a2a_tensor(tensor):
+    if forward_mode == "none":
+        return all_to_all_single_autograd(
+            tensor,
+            output_splits,
+            input_splits,
+            group,
+        )
+    if not _lbt_should_compress_a2a_tensor(tensor):
+        if _lbt_ep_a2a_custom_autograd_below_threshold():
+            return _LBTCompressedAllToAll.apply(
+                tensor,
+                output_splits,
+                input_splits,
+                group,
+                "none",
+                "none",
+            )
         return all_to_all_single_autograd(
             tensor,
             output_splits,
