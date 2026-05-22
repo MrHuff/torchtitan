@@ -84,6 +84,19 @@ def _lbt_ep_a2a_scale_mode() -> str:
     )
 
 
+def _lbt_ep_a2a_compress_min_bytes() -> int:
+    try:
+        min_bytes = int(os.environ.get("LBT_EP_A2A_COMPRESS_MIN_BYTES", str(16 << 20)))
+    except ValueError:
+        min_bytes = 16 << 20
+    return max(0, min_bytes)
+
+
+def _lbt_should_compress_a2a_tensor(tensor: torch.Tensor) -> bool:
+    min_bytes = _lbt_ep_a2a_compress_min_bytes()
+    return min_bytes == 0 or tensor.numel() * tensor.element_size() >= min_bytes
+
+
 def _lbt_fp8_dtype(mode: str) -> torch.dtype:
     if mode == "fp8_e4m3":
         return torch.float8_e4m3fn
@@ -92,13 +105,18 @@ def _lbt_fp8_dtype(mode: str) -> torch.dtype:
     raise ValueError(f"Unsupported FP8 all-to-all mode: {mode}")
 
 
-def _lbt_static_fp8_scale(device: torch.device) -> torch.Tensor:
+def _lbt_static_fp8_scale_value() -> float:
     try:
         scale = float(os.environ.get("LBT_EP_A2A_FP8_STATIC_SCALE", "1.0"))
     except ValueError:
         scale = 1.0
     if scale <= 0:
         scale = 1.0
+    return scale
+
+
+def _lbt_static_fp8_scale(device: torch.device) -> torch.Tensor:
+    scale = _lbt_static_fp8_scale_value()
     return torch.tensor(scale, device=device, dtype=torch.float32)
 
 
@@ -134,13 +152,12 @@ def _lbt_apply_source_scales(
     output_splits: list[int],
     scales: torch.Tensor,
 ) -> torch.Tensor:
+    scales = scales.to(device=tensor.device, dtype=tensor.dtype)
     offset = 0
     for source_rank, split in enumerate(output_splits):
         split = int(split)
         if split > 0:
-            tensor.narrow(0, offset, split).mul_(
-                scales[source_rank].to(device=tensor.device, dtype=tensor.dtype)
-            )
+            tensor.narrow(0, offset, split).mul_(scales[source_rank])
         offset += split
     return tensor
 
@@ -170,10 +187,30 @@ def _lbt_compressed_all_to_all(
     group,
     mode: str,
 ) -> torch.Tensor:
-    if mode == "none":
+    if mode == "none" or not _lbt_should_compress_a2a_tensor(tensor):
         return _lbt_all_to_all_no_autograd(tensor, output_splits, input_splits, group)
 
     output_dtype = tensor.dtype
+    if _lbt_ep_a2a_scale_mode() == "static":
+        fp8_dtype = _lbt_fp8_dtype(mode)
+        fp8_max = torch.finfo(fp8_dtype).max
+        scale = _lbt_static_fp8_scale_value()
+        if scale == 1.0:
+            payload = torch.clamp(tensor, min=-fp8_max, max=fp8_max).to(fp8_dtype)
+        else:
+            payload = torch.clamp(tensor / scale, min=-fp8_max, max=fp8_max).to(
+                fp8_dtype
+            )
+        output = _lbt_all_to_all_no_autograd(
+            payload.contiguous(),
+            output_splits,
+            input_splits,
+            group,
+        ).to(output_dtype)
+        if scale != 1.0:
+            output.mul_(scale)
+        return output
+
     payload, source_scales = _lbt_quantize_fp8_for_a2a(tensor, mode, group)
     output = _lbt_all_to_all_no_autograd(
         payload,
@@ -226,7 +263,7 @@ def _lbt_all_to_all_single_autograd(
     group,
 ) -> torch.Tensor:
     forward_mode = _lbt_ep_a2a_mode()
-    if forward_mode == "none":
+    if forward_mode == "none" or not _lbt_should_compress_a2a_tensor(tensor):
         return all_to_all_single_autograd(
             tensor,
             output_splits,
