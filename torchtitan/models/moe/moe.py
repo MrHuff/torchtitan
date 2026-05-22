@@ -1155,6 +1155,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self._debug_force_load_balance = _debug_force_load_balance
         self._debug_force_load_balance_counts_cache = {}
         self._debug_force_load_balance_indices_cache = {}
+        self._ep_route_coverage_stripe_cache = {}
 
     def _debug_force_load_balance_routing(
         self, scores: torch.Tensor
@@ -1204,17 +1205,134 @@ class TokenChoiceTopKRouter(nn.Module):
         self._debug_force_load_balance_counts_cache[cache_key] = counts
         return counts
 
+    def _ep_route_coverage_degree(self) -> int:
+        ep_degree = _lbt_env_int("LBT_MOE_EP_ROUTE_COVERAGE_DEGREE", 0)
+        if (
+            _lbt_env_flag("LBT_MOE_EP_ROUTE_COVERAGE")
+            and ep_degree == 2
+            and self.top_k >= ep_degree
+            and self.num_experts % ep_degree == 0
+        ):
+            return ep_degree
+        return 0
+
+    def _ep_route_coverage_mode(self) -> str:
+        return os.environ.get("LBT_MOE_EP_ROUTE_COVERAGE_MODE", "best").strip().lower()
+
+    def _use_striped_ep_route_coverage(self) -> bool:
+        mode = self._ep_route_coverage_mode()
+        return mode in ("stripe", "striped", "balanced") and self.top_k == 3
+
+    def _ep_route_stripe_indices(
+        self,
+        n_tokens: int,
+        experts_per_group: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        cache_key = (n_tokens, experts_per_group, device.type, device.index)
+        cached = self._ep_route_coverage_stripe_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        indices = torch.arange(n_tokens, device=device, dtype=torch.int64)
+        self._ep_route_coverage_stripe_cache[cache_key] = indices
+        return indices
+
+    def _select_striped_ep_route_coverage(
+        self,
+        route_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        experts_per_group = self.num_experts // 2
+        group0 = torch.topk(route_scores[:, :experts_per_group], k=2, dim=1).indices
+        group1 = (
+            torch.topk(route_scores[:, experts_per_group:], k=2, dim=1).indices
+            + experts_per_group
+        )
+        group0_major = torch.stack((group0[:, 0], group0[:, 1], group1[:, 0]), dim=1)
+        group1_major = torch.stack((group1[:, 0], group1[:, 1], group0[:, 0]), dim=1)
+        stripe_indices = self._ep_route_stripe_indices(
+            int(route_scores.shape[0]),
+            experts_per_group,
+            route_scores.device,
+        )
+        group1_mask = (stripe_indices & 1).bool().unsqueeze(1)
+        return torch.where(group1_mask, group1_major, group0_major)
+
+    def _apply_striped_balance_ep_route_coverage(
+        self,
+        selected_experts_indices: torch.Tensor,
+        selected_groups: torch.Tensor,
+        experts_per_group: int,
+    ) -> torch.Tensor:
+        stripe_indices = self._ep_route_stripe_indices(
+            int(selected_experts_indices.shape[0]),
+            experts_per_group,
+            selected_experts_indices.device,
+        )
+        base_local = stripe_indices.remainder(experts_per_group)
+        group0_candidate = base_local
+        group1_candidate = base_local + experts_per_group
+        group0_candidate = torch.where(
+            (selected_experts_indices == group0_candidate.unsqueeze(1)).any(dim=1),
+            (base_local + 1).remainder(experts_per_group),
+            group0_candidate,
+        )
+        group1_candidate = torch.where(
+            (selected_experts_indices == group1_candidate.unsqueeze(1)).any(dim=1),
+            (base_local + 1).remainder(experts_per_group) + experts_per_group,
+            group1_candidate,
+        )
+        group0_candidate_2 = (group0_candidate + 1).remainder(experts_per_group)
+        group1_candidate_2 = (
+            (group1_candidate - experts_per_group + 1).remainder(experts_per_group)
+            + experts_per_group
+        )
+
+        desired_group1 = (stripe_indices & 1).to(selected_groups.dtype) + 1
+        current_group1 = selected_groups.sum(dim=1)
+        need_group1 = torch.clamp_min(desired_group1 - current_group1, 0)
+        need_group0 = torch.clamp_min(current_group1 - desired_group1, 0)
+        selected_experts_indices = selected_experts_indices.clone()
+        added_group1 = torch.zeros_like(need_group1)
+        added_group0 = torch.zeros_like(need_group0)
+
+        for pos in range(self.top_k - 1, -1, -1):
+            replace_group1 = (selected_groups[:, pos] == 0) & (need_group1 > 0)
+            replacement_group1 = torch.where(
+                added_group1 == 0,
+                group1_candidate,
+                group1_candidate_2,
+            )
+            selected_experts_indices[:, pos] = torch.where(
+                replace_group1,
+                replacement_group1,
+                selected_experts_indices[:, pos],
+            )
+            added_group1 = added_group1 + replace_group1.to(added_group1.dtype)
+            need_group1 = need_group1 - replace_group1.to(need_group1.dtype)
+
+            replace_group0 = (selected_groups[:, pos] == 1) & (need_group0 > 0)
+            replacement_group0 = torch.where(
+                added_group0 == 0,
+                group0_candidate,
+                group0_candidate_2,
+            )
+            selected_experts_indices[:, pos] = torch.where(
+                replace_group0,
+                replacement_group0,
+                selected_experts_indices[:, pos],
+            )
+            added_group0 = added_group0 + replace_group0.to(added_group0.dtype)
+            need_group0 = need_group0 - replace_group0.to(need_group0.dtype)
+
+        return selected_experts_indices
+
     def _apply_ep_route_coverage(
         self,
         route_scores: torch.Tensor,
         selected_experts_indices: torch.Tensor,
     ) -> torch.Tensor:
-        if not _lbt_env_flag("LBT_MOE_EP_ROUTE_COVERAGE"):
-            return selected_experts_indices
-        ep_degree = _lbt_env_int("LBT_MOE_EP_ROUTE_COVERAGE_DEGREE", 0)
-        if ep_degree != 2 or self.top_k < ep_degree:
-            return selected_experts_indices
-        if self.num_experts % ep_degree != 0:
+        ep_degree = self._ep_route_coverage_degree()
+        if ep_degree != 2:
             return selected_experts_indices
 
         experts_per_group = self.num_experts // ep_degree
@@ -1222,12 +1340,28 @@ class TokenChoiceTopKRouter(nn.Module):
         missing_group0 = (selected_groups == 1).all(dim=1)
         missing_group1 = (selected_groups == 0).all(dim=1)
 
+        if self._ep_route_coverage_mode() in ("balanced_fast", "fast_balanced"):
+            return self._apply_striped_balance_ep_route_coverage(
+                selected_experts_indices,
+                selected_groups,
+                experts_per_group,
+            )
+
         selected_experts_indices = selected_experts_indices.clone()
-        best_group0 = torch.argmax(route_scores[:, :experts_per_group], dim=1)
-        best_group1 = (
-            torch.argmax(route_scores[:, experts_per_group:], dim=1)
-            + experts_per_group
-        )
+        if self._ep_route_coverage_mode() in ("fast", "striped_missing", "round_robin"):
+            stripe_indices = self._ep_route_stripe_indices(
+                int(route_scores.shape[0]),
+                experts_per_group,
+                route_scores.device,
+            )
+            best_group0 = stripe_indices.remainder(experts_per_group)
+            best_group1 = best_group0 + experts_per_group
+        else:
+            best_group0 = torch.argmax(route_scores[:, :experts_per_group], dim=1)
+            best_group1 = (
+                torch.argmax(route_scores[:, experts_per_group:], dim=1)
+                + experts_per_group
+            )
         replacement = torch.where(
             missing_group0,
             best_group0,
@@ -1276,25 +1410,32 @@ class TokenChoiceTopKRouter(nn.Module):
         #       top_scores is still derived from the original scores.
         elif expert_bias is not None:
             route_scores = scores + expert_bias
-            _, selected_experts_indices = torch.topk(
-                route_scores, k=self.top_k, dim=1
-            )
-            selected_experts_indices = self._apply_ep_route_coverage(
-                route_scores,
-                selected_experts_indices,
-            )
+            if self._ep_route_coverage_degree() == 2 and self._use_striped_ep_route_coverage():
+                selected_experts_indices = self._select_striped_ep_route_coverage(route_scores)
+            else:
+                _, selected_experts_indices = torch.topk(
+                    route_scores, k=self.top_k, dim=1
+                )
+                selected_experts_indices = self._apply_ep_route_coverage(
+                    route_scores,
+                    selected_experts_indices,
+                )
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
-            top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=1
-            )
-            covered_selected_experts_indices = self._apply_ep_route_coverage(
-                scores,
-                selected_experts_indices,
-            )
-            if covered_selected_experts_indices is not selected_experts_indices:
-                selected_experts_indices = covered_selected_experts_indices
+            if self._ep_route_coverage_degree() == 2 and self._use_striped_ep_route_coverage():
+                selected_experts_indices = self._select_striped_ep_route_coverage(scores)
                 top_scores = scores.gather(dim=1, index=selected_experts_indices)
+            else:
+                top_scores, selected_experts_indices = torch.topk(
+                    scores, k=self.top_k, dim=1
+                )
+                covered_selected_experts_indices = self._apply_ep_route_coverage(
+                    scores,
+                    selected_experts_indices,
+                )
+                if covered_selected_experts_indices is not selected_experts_indices:
+                    selected_experts_indices = covered_selected_experts_indices
+                    top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
         if "LBT_MOE_ROUTER_DEBUG" in os.environ:
             _lbt_moe_router_debug(
