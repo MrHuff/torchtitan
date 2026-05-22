@@ -2211,7 +2211,7 @@ class MoE(nn.Module):
             route_metadata_maybe_unsafe
             and _mxfp4_deepseek_allow_unsafe_tk_ep_route()
         ):
-            num_tokens_per_expert = num_tokens_per_expert.to(torch.int64).clone()
+            num_tokens_per_expert = num_tokens_per_expert.to(torch.int64)
 
         if (
             route_inverse_experts_sorted is None
