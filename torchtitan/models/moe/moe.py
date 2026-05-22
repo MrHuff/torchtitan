@@ -595,7 +595,7 @@ def _mxfp4_deepseek_tk_scored_fallback_combine_fwd() -> bool:
 def _mxfp4_deepseek_tk_scored_fallback_combine_bwd() -> bool:
     return _lbt_env_flag(
         "MXFP4_DEEPSEEK_TK_SCORED_FALLBACK_COMBINE_BWD",
-        False,
+        True,
     )
 
 
