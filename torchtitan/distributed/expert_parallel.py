@@ -131,6 +131,23 @@ def _lbt_gather_ep_scales(scale: torch.Tensor, group) -> torch.Tensor:
     return scales
 
 
+def _lbt_equal_splits(total: int, parts: int) -> list[int]:
+    if parts <= 0:
+        return []
+    return [int(total) // int(parts) for _ in range(int(parts))]
+
+
+def _lbt_ep_exact_equal_split_a2a() -> bool:
+    mode = os.environ.get("LBT_MOE_EP_ROUTE_COVERAGE_MODE", "").strip().lower()
+    degree = os.environ.get("LBT_MOE_EP_ROUTE_COVERAGE_DEGREE", "").strip()
+    return (
+        _lbt_env_flag("LBT_EP_EXACT_EQUAL_SPLIT_A2A")
+        and _lbt_env_flag("LBT_MOE_EP_ROUTE_COVERAGE")
+        and degree == "2"
+        and mode in ("balanced", "balanced_fast", "fast_balanced")
+    )
+
+
 def _lbt_quantize_fp8_for_a2a(
     tensor: torch.Tensor,
     mode: str,
@@ -153,9 +170,11 @@ def _lbt_quantize_fp8_for_a2a(
 
 def _lbt_apply_source_scales(
     tensor: torch.Tensor,
-    output_splits: list[int],
+    output_splits: list[int] | None,
     scales: torch.Tensor,
 ) -> torch.Tensor:
+    if output_splits is None:
+        output_splits = _lbt_equal_splits(int(tensor.shape[0]), int(scales.numel()))
     scales = scales.to(device=tensor.device, dtype=tensor.dtype)
     offset = 0
     for source_rank, split in enumerate(output_splits):
@@ -168,11 +187,15 @@ def _lbt_apply_source_scales(
 
 def _lbt_all_to_all_no_autograd(
     tensor: torch.Tensor,
-    output_splits: list[int],
-    input_splits: list[int],
+    output_splits: list[int] | None,
+    input_splits: list[int] | None,
     group,
 ) -> torch.Tensor:
-    output_shape = (sum(output_splits), *tensor.shape[1:])
+    output_shape = (
+        tuple(tensor.shape)
+        if output_splits is None
+        else (sum(output_splits), *tensor.shape[1:])
+    )
     output = torch.empty(output_shape, device=tensor.device, dtype=tensor.dtype)
     torch.distributed.all_to_all_single(
         output,
@@ -186,8 +209,8 @@ def _lbt_all_to_all_no_autograd(
 
 def _lbt_compressed_all_to_all(
     tensor: torch.Tensor,
-    output_splits: list[int],
-    input_splits: list[int],
+    output_splits: list[int] | None,
+    input_splits: list[int] | None,
     group,
     mode: str,
 ) -> torch.Tensor:
@@ -230,14 +253,18 @@ class _LBTCompressedAllToAll(torch.autograd.Function):
     def forward(
         ctx,
         tensor: torch.Tensor,
-        output_splits: list[int],
-        input_splits: list[int],
+        output_splits: list[int] | None,
+        input_splits: list[int] | None,
         group,
         forward_mode: str,
         backward_mode: str,
     ) -> torch.Tensor:
-        ctx.output_splits = [int(split) for split in output_splits]
-        ctx.input_splits = [int(split) for split in input_splits]
+        ctx.output_splits = (
+            None if output_splits is None else [int(split) for split in output_splits]
+        )
+        ctx.input_splits = (
+            None if input_splits is None else [int(split) for split in input_splits]
+        )
         ctx.group = group
         ctx.backward_mode = backward_mode
         return _lbt_compressed_all_to_all(
@@ -262,8 +289,8 @@ class _LBTCompressedAllToAll(torch.autograd.Function):
 
 def _lbt_all_to_all_single_autograd(
     tensor: torch.Tensor,
-    output_splits: list[int],
-    input_splits: list[int],
+    output_splits: list[int] | None,
+    input_splits: list[int] | None,
     group,
 ) -> torch.Tensor:
     forward_mode = _lbt_ep_a2a_mode()
@@ -391,6 +418,7 @@ class ExpertParallel(ParallelStyle):
         super().__init__()
         self.input_splits = None
         self.output_splits = None
+        self._equal_split_a2a = False
         self.input_shape = None
         self.permuted_indices = None
 
@@ -423,10 +451,17 @@ class ExpertParallel(ParallelStyle):
             num_tokens_per_expert = num_tokens_per_expert.to(torch.int64)
         ep_degree = device_mesh.shape[0]
         num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
+        total_routed_rows = int(routed_input.shape[0])
+        equal_split_a2a = (
+            ep_degree == 2
+            and total_routed_rows % ep_degree == 0
+            and _lbt_ep_exact_equal_split_a2a()
+        )
 
         # generate the input splits and output splits for all-to-all
         with torch.no_grad():
-            input_split_sizes = num_tokens_per_expert.view(ep_degree, -1).sum(dim=1)
+            if not equal_split_a2a:
+                input_split_sizes = num_tokens_per_expert.view(ep_degree, -1).sum(dim=1)
             if _lbt_ep_split_count_all_gather():
                 gathered_counts = torch.empty(
                     ep_degree * num_tokens_per_expert.numel(),
@@ -456,12 +491,6 @@ class ExpertParallel(ParallelStyle):
                 num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
                     num_tokens_per_expert_group
                 )
-            split_sizes = torch.stack(
-                (
-                    input_split_sizes,
-                    num_tokens_per_expert_group.view(ep_degree, -1).sum(dim=1),
-                )
-            )
             alignment = int(moe_utils.TOKEN_GROUP_ALIGN_SIZE_M)
             local_expert_counts = num_tokens_per_expert_group.view(ep_degree, -1).sum(dim=0)
             local_expert_counts = torch.clamp_min(local_expert_counts, alignment)
@@ -469,18 +498,36 @@ class ExpertParallel(ParallelStyle):
                 (local_expert_counts + alignment - 1) // alignment * alignment
             )
             local_expert_counts_i32 = local_expert_counts.to(torch.int32)
-            # all_to_all_single requires host split lists. Copy dispatch splits
-            # and the post-permute local expert counts together so downstream
-            # grouped experts do not pay another tiny D2H synchronization.
-            host_sizes = torch.cat(
-                (
-                    split_sizes.reshape(-1).to(torch.int64),
-                    local_expert_counts.reshape(-1).to(torch.int64),
+            if equal_split_a2a:
+                self.input_splits = _lbt_equal_splits(total_routed_rows, ep_degree)
+                self.output_splits = list(self.input_splits)
+                # Only local expert counts need a host list in exact equal-split
+                # mode; the activation all-to-all can use implicit equal splits.
+                local_expert_counts_list = (
+                    local_expert_counts.to(torch.int64)
+                    .to(torch.device("cpu"), non_blocking=False)
+                    .tolist()
                 )
-            ).to(torch.device("cpu"), non_blocking=False)
-            self.input_splits = host_sizes[:ep_degree].tolist()
-            self.output_splits = host_sizes[ep_degree : 2 * ep_degree].tolist()
-            local_expert_counts_list = host_sizes[2 * ep_degree :].tolist()
+            else:
+                split_sizes = torch.stack(
+                    (
+                        input_split_sizes,
+                        num_tokens_per_expert_group.view(ep_degree, -1).sum(dim=1),
+                    )
+                )
+                # all_to_all_single requires host split lists. Copy dispatch splits
+                # and the post-permute local expert counts together so downstream
+                # grouped experts do not pay another tiny D2H synchronization.
+                host_sizes = torch.cat(
+                    (
+                        split_sizes.reshape(-1).to(torch.int64),
+                        local_expert_counts.reshape(-1).to(torch.int64),
+                    )
+                ).to(torch.device("cpu"), non_blocking=False)
+                self.input_splits = host_sizes[:ep_degree].tolist()
+                self.output_splits = host_sizes[ep_degree : 2 * ep_degree].tolist()
+                local_expert_counts_list = host_sizes[2 * ep_degree :].tolist()
+            self._equal_split_a2a = equal_split_a2a
 
         _lbt_debug_ep_splits(
             "dispatch",
@@ -493,8 +540,8 @@ class ExpertParallel(ParallelStyle):
         # perform all-to-all
         routed_input = _lbt_all_to_all_single_autograd(
             routed_input,
-            self.output_splits,
-            self.input_splits,
+            None if self._equal_split_a2a else self.output_splits,
+            None if self._equal_split_a2a else self.input_splits,
             device_mesh.get_group(),
         )
 
@@ -552,8 +599,8 @@ class ExpertParallel(ParallelStyle):
 
         routed_output = _lbt_all_to_all_single_autograd(
             routed_output,
-            self.input_splits,
-            self.output_splits,
+            None if self._equal_split_a2a else self.input_splits,
+            None if self._equal_split_a2a else self.output_splits,
             device_mesh.get_group(),
         )
         return routed_output

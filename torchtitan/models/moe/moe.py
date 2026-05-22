@@ -17,6 +17,7 @@ from .utils import indices_padding_wrapper
 
 _MXFP4_MOE_REORDER_FN = None
 _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
+_MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN = None
 _MXFP4_MOE_GATHER_SCORES_FN = None
 _MXFP4_MOE_SCATTER_SCORES_FN = None
 _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
@@ -418,6 +419,11 @@ def _get_mxfp4_moe_reorder_scores_full_fn():
     return _MXFP4_MOE_REORDER_SCORES_FULL_FN
 
 
+def _get_mxfp4_moe_ep2_balance_top3_routes_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN
+
+
 def _get_mxfp4_moe_scatter_scores_fn():
     _ensure_mxfp4_moe_route_imports()
     return _MXFP4_MOE_SCATTER_SCORES_FN
@@ -460,6 +466,7 @@ def _get_mxfp4_moe_indexed_scale_rows_fn():
 
 def _ensure_mxfp4_moe_route_imports():
     global _MXFP4_MOE_REORDER_FN, _MXFP4_MOE_REORDER_SCORES_FULL_FN
+    global _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN
     global _MXFP4_MOE_GATHER_SCORES_FN, _MXFP4_MOE_SCATTER_SCORES_FN
     global _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN
     global _MXFP4_MOE_ROUTE_COMBINE_ADD_FN, _MXFP4_MOE_SCALE_SCATTER_ADD_FN
@@ -474,6 +481,7 @@ def _ensure_mxfp4_moe_route_imports():
     except ImportError:
         _MXFP4_MOE_REORDER_FN = None
         _MXFP4_MOE_REORDER_SCORES_FULL_FN = None
+        _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN = None
         _MXFP4_MOE_GATHER_SCORES_FN = None
         _MXFP4_MOE_SCATTER_SCORES_FN = None
         _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
@@ -486,6 +494,9 @@ def _ensure_mxfp4_moe_route_imports():
         _MXFP4_MOE_REORDER_FN = getattr(mxfp4_backend, "mxfp4_moe_reorder_indices", None)
         _MXFP4_MOE_REORDER_SCORES_FULL_FN = getattr(
             mxfp4_backend, "mxfp4_moe_reorder_scores_full", None
+        )
+        _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_ep2_balance_top3_routes", None
         )
         _MXFP4_MOE_GATHER_SCORES_FN = getattr(mxfp4_backend, "mxfp4_moe_gather_scores", None)
         _MXFP4_MOE_SCATTER_SCORES_FN = getattr(mxfp4_backend, "mxfp4_moe_scatter_scores", None)
@@ -564,6 +575,14 @@ def _mxfp4_deepseek_tk_scored_fallback_combine_bwd() -> bool:
         "MXFP4_DEEPSEEK_TK_SCORED_FALLBACK_COMBINE_BWD",
         False,
     )
+
+
+def _mxfp4_deepseek_tk_scored_route_inverse_combine() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_SCORED_ROUTE_INVERSE_COMBINE", False)
+
+
+def _mxfp4_deepseek_tk_ep2_balance_routes() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_BALANCE_ROUTES", True)
 
 
 def _mxfp4_deepseek_tk_indexed_scale_bwd() -> bool:
@@ -806,7 +825,11 @@ class _MoEScoredIndexCombineFunction(torch.autograd.Function):
             saved_for_backward = True
             routed_output_bf16 = _mxfp4_as_contiguous_dtype(routed_output, torch.bfloat16)
             base_bf16 = _mxfp4_as_contiguous_dtype(base, torch.bfloat16)
-            if route_inverse is not None and int(top_k) > 0:
+            if (
+                route_inverse is not None
+                and int(top_k) > 0
+                and _mxfp4_deepseek_tk_scored_route_inverse_combine()
+            ):
                 combine_add_fn = _get_mxfp4_moe_route_combine_add_fn()
                 if combine_add_fn is not None:
                     try:
@@ -1223,19 +1246,23 @@ class TokenChoiceTopKRouter(nn.Module):
         mode = self._ep_route_coverage_mode()
         return mode in ("stripe", "striped", "balanced") and self.top_k == 3
 
-    def _ep_route_stripe_indices(
+    def _ep_route_stripe_tensors(
         self,
         n_tokens: int,
         experts_per_group: int,
         device: torch.device,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cache_key = (n_tokens, experts_per_group, device.type, device.index)
         cached = self._ep_route_coverage_stripe_cache.get(cache_key)
         if cached is not None:
             return cached
         indices = torch.arange(n_tokens, device=device, dtype=torch.int64)
-        self._ep_route_coverage_stripe_cache[cache_key] = indices
-        return indices
+        local_indices = indices.remainder(experts_per_group)
+        remote_indices = local_indices + experts_per_group
+        group1_mask = (indices & 1).bool()
+        cached = (local_indices, remote_indices, group1_mask)
+        self._ep_route_coverage_stripe_cache[cache_key] = cached
+        return cached
 
     def _select_striped_ep_route_coverage(
         self,
@@ -1249,28 +1276,42 @@ class TokenChoiceTopKRouter(nn.Module):
         )
         group0_major = torch.stack((group0[:, 0], group0[:, 1], group1[:, 0]), dim=1)
         group1_major = torch.stack((group1[:, 0], group1[:, 1], group0[:, 0]), dim=1)
-        stripe_indices = self._ep_route_stripe_indices(
+        _stripe_local, _stripe_remote, group1_mask = self._ep_route_stripe_tensors(
             int(route_scores.shape[0]),
             experts_per_group,
             route_scores.device,
         )
-        group1_mask = (stripe_indices & 1).bool().unsqueeze(1)
-        return torch.where(group1_mask, group1_major, group0_major)
+        return torch.where(group1_mask.unsqueeze(1), group1_major, group0_major)
 
     def _apply_striped_balance_ep_route_coverage(
         self,
         selected_experts_indices: torch.Tensor,
-        selected_groups: torch.Tensor,
+        selected_group1: torch.Tensor,
         experts_per_group: int,
     ) -> torch.Tensor:
-        stripe_indices = self._ep_route_stripe_indices(
+        if (
+            _mxfp4_deepseek_tk_ep2_balance_routes()
+            and self.top_k == 3
+            and selected_experts_indices.is_cuda
+            and selected_experts_indices.dtype == torch.int64
+        ):
+            balance_fn = _get_mxfp4_moe_ep2_balance_top3_routes_fn()
+            if balance_fn is not None:
+                try:
+                    return balance_fn(
+                        selected_experts_indices.contiguous(),
+                        experts_per_group,
+                    )
+                except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                    pass
+
+        base_local, base_remote, group1_mask = self._ep_route_stripe_tensors(
             int(selected_experts_indices.shape[0]),
             experts_per_group,
             selected_experts_indices.device,
         )
-        base_local = stripe_indices.remainder(experts_per_group)
         group0_candidate = base_local
-        group1_candidate = base_local + experts_per_group
+        group1_candidate = base_remote
         group0_candidate = torch.where(
             (selected_experts_indices == group0_candidate.unsqueeze(1)).any(dim=1),
             (base_local + 1).remainder(experts_per_group),
@@ -1287,8 +1328,8 @@ class TokenChoiceTopKRouter(nn.Module):
             + experts_per_group
         )
 
-        desired_group1 = (stripe_indices & 1).to(selected_groups.dtype) + 1
-        current_group1 = selected_groups.sum(dim=1)
+        current_group1 = selected_group1.to(torch.int64).sum(dim=1)
+        desired_group1 = group1_mask.to(current_group1.dtype) + 1
         need_group1 = torch.clamp_min(desired_group1 - current_group1, 0)
         need_group0 = torch.clamp_min(current_group1 - desired_group1, 0)
         selected_experts_indices = selected_experts_indices.clone()
@@ -1296,7 +1337,7 @@ class TokenChoiceTopKRouter(nn.Module):
         added_group0 = torch.zeros_like(need_group0)
 
         for pos in range(self.top_k - 1, -1, -1):
-            replace_group1 = (selected_groups[:, pos] == 0) & (need_group1 > 0)
+            replace_group1 = (~selected_group1[:, pos]) & (need_group1 > 0)
             replacement_group1 = torch.where(
                 added_group1 == 0,
                 group1_candidate,
@@ -1310,7 +1351,7 @@ class TokenChoiceTopKRouter(nn.Module):
             added_group1 = added_group1 + replace_group1.to(added_group1.dtype)
             need_group1 = need_group1 - replace_group1.to(need_group1.dtype)
 
-            replace_group0 = (selected_groups[:, pos] == 1) & (need_group0 > 0)
+            replace_group0 = selected_group1[:, pos] & (need_group0 > 0)
             replacement_group0 = torch.where(
                 added_group0 == 0,
                 group0_candidate,
@@ -1336,26 +1377,26 @@ class TokenChoiceTopKRouter(nn.Module):
             return selected_experts_indices
 
         experts_per_group = self.num_experts // ep_degree
-        selected_groups = selected_experts_indices // experts_per_group
-        missing_group0 = (selected_groups == 1).all(dim=1)
-        missing_group1 = (selected_groups == 0).all(dim=1)
+        selected_group1 = selected_experts_indices >= experts_per_group
 
         if self._ep_route_coverage_mode() in ("balanced_fast", "fast_balanced"):
             return self._apply_striped_balance_ep_route_coverage(
                 selected_experts_indices,
-                selected_groups,
+                selected_group1,
                 experts_per_group,
             )
 
+        missing_group0 = selected_group1.all(dim=1)
+        missing_group1 = (~selected_group1).all(dim=1)
         selected_experts_indices = selected_experts_indices.clone()
         if self._ep_route_coverage_mode() in ("fast", "striped_missing", "round_robin"):
-            stripe_indices = self._ep_route_stripe_indices(
+            base_local, base_remote, _group1_mask = self._ep_route_stripe_tensors(
                 int(route_scores.shape[0]),
                 experts_per_group,
                 route_scores.device,
             )
-            best_group0 = stripe_indices.remainder(experts_per_group)
-            best_group1 = best_group0 + experts_per_group
+            best_group0 = base_local
+            best_group1 = base_remote
         else:
             best_group0 = torch.argmax(route_scores[:, :experts_per_group], dim=1)
             best_group1 = (
@@ -1806,7 +1847,7 @@ class MoE(nn.Module):
                 except Exception:
                     fused_moe_combine = None
         skip_router_histc = (
-            fused_moe_combine is not None
+            (fused_moe_combine is not None or _mxfp4_deepseek_route_scores_full_fallback())
             and os.environ.get("MXFP4_DEEPSEEK_SKIP_ROUTER_HISTC", "1") != "0"
             and not self.router._debug_force_load_balance
         )
