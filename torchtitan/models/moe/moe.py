@@ -608,7 +608,7 @@ def _mxfp4_deepseek_tk_ep2_balance_routes() -> bool:
 
 
 def _mxfp4_deepseek_tk_ep2_select_top3() -> bool:
-    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_SELECT_TOP3", True)
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_SELECT_TOP3", False)
 
 
 def _mxfp4_deepseek_tk_indexed_scale_bwd() -> bool:
