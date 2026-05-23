@@ -25,6 +25,7 @@ _MXFP4_MOE_SCATTER_SCORES_FN = None
 _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
 _MXFP4_MOE_ROUTE_COMBINE_ADD_FN = None
 _MXFP4_MOE_SCALE_SCATTER_ADD_FN = None
+_MXFP4_MOE_SCATTER_ADD_FN = None
 _MXFP4_MOE_INDEXED_DOT_ROWS_FN = None
 _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = None
 _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = None
@@ -461,6 +462,11 @@ def _get_mxfp4_moe_scale_scatter_add_fn():
     return _MXFP4_MOE_SCALE_SCATTER_ADD_FN
 
 
+def _get_mxfp4_moe_scatter_add_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_SCATTER_ADD_FN
+
+
 def _get_mxfp4_moe_indexed_dot_rows_fn():
     _ensure_mxfp4_moe_route_imports()
     return _MXFP4_MOE_INDEXED_DOT_ROWS_FN
@@ -484,6 +490,7 @@ def _ensure_mxfp4_moe_route_imports():
     global _MXFP4_MOE_GATHER_SCORES_FN, _MXFP4_MOE_SCATTER_SCORES_FN
     global _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN
     global _MXFP4_MOE_ROUTE_COMBINE_ADD_FN, _MXFP4_MOE_SCALE_SCATTER_ADD_FN
+    global _MXFP4_MOE_SCATTER_ADD_FN
     global _MXFP4_MOE_INDEXED_DOT_ROWS_FN, _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN
     global _MXFP4_MOE_INDEXED_SCALE_ROWS_FN
     global _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED
@@ -503,6 +510,7 @@ def _ensure_mxfp4_moe_route_imports():
         _MXFP4_MOE_BUILD_ROUTE_INVERSE_FN = None
         _MXFP4_MOE_ROUTE_COMBINE_ADD_FN = None
         _MXFP4_MOE_SCALE_SCATTER_ADD_FN = None
+        _MXFP4_MOE_SCATTER_ADD_FN = None
         _MXFP4_MOE_INDEXED_DOT_ROWS_FN = None
         _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = None
         _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = None
@@ -530,6 +538,9 @@ def _ensure_mxfp4_moe_route_imports():
         )
         _MXFP4_MOE_SCALE_SCATTER_ADD_FN = getattr(
             mxfp4_backend, "mxfp4_moe_scale_scatter_add_bf16", None
+        )
+        _MXFP4_MOE_SCATTER_ADD_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_scatter_add_bf16", None
         )
         _MXFP4_MOE_INDEXED_DOT_ROWS_FN = getattr(
             mxfp4_backend, "mxfp4_moe_indexed_dot_rows_bf16", None
@@ -597,6 +608,10 @@ def _mxfp4_deepseek_tk_scored_fallback_combine_bwd() -> bool:
         "MXFP4_DEEPSEEK_TK_SCORED_FALLBACK_COMBINE_BWD",
         True,
     )
+
+
+def _mxfp4_deepseek_tk_index_fallback_combine_fwd() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_INDEX_FALLBACK_COMBINE_FWD", False)
 
 
 def _mxfp4_deepseek_tk_scored_route_inverse_combine() -> bool:
@@ -875,6 +890,26 @@ class _MoEIndexCombineFunction(torch.autograd.Function):
     ):
         token_indices = token_indices.reshape(-1).contiguous()
         ctx.save_for_backward(token_indices)
+        if (
+            _mxfp4_deepseek_tk_index_fallback_combine_fwd()
+            and base.is_cuda
+            and routed_output.is_cuda
+            and token_indices.is_cuda
+            and base.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            scatter_add_fn = _get_mxfp4_moe_scatter_add_fn()
+            if scatter_add_fn is not None:
+                try:
+                    out = base.clone()
+                    scatter_add_fn(
+                        _mxfp4_as_contiguous_dtype(routed_output, torch.bfloat16),
+                        token_indices,
+                        out,
+                    )
+                    return out
+                except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                    pass
         out = base.clone()
         out.index_add_(0, token_indices, routed_output)
         return out
@@ -1472,7 +1507,10 @@ class TokenChoiceTopKRouter(nn.Module):
         experts_per_group = self.num_experts // ep_degree
         selected_group1 = selected_experts_indices >= experts_per_group
 
-        if self._ep_route_coverage_mode() in ("balanced_fast", "fast_balanced"):
+        if (
+            self._ep_route_coverage_mode() in ("balanced_fast", "fast_balanced")
+            and self.top_k == 3
+        ):
             return self._apply_striped_balance_ep_route_coverage(
                 selected_experts_indices,
                 selected_group1,
@@ -2364,8 +2402,38 @@ class MoE(nn.Module):
                     flush=True,
                 )
 
-        # shape (bs*slen*top_k, dim)
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        routed_output_is_scored = False
+        routed_output_is_precombined = False
+        routed_output = None
+        ep_scored_output_combine = (
+            getattr(self.experts, "forward_ep_scored_output_combine", None)
+            if use_indexed_fallback_combine and not self.score_before_experts
+            else None
+        )
+        if ep_scored_output_combine is not None:
+            if top_scores_experts_sorted is None:
+                if route_positions_experts_sorted is not None:
+                    top_scores_experts_sorted = _mxfp4_gather_route_scores(
+                        top_scores,
+                        route_positions_experts_sorted,
+                    )
+            if top_scores_experts_sorted is not None:
+                routed_output = ep_scored_output_combine(
+                    routed_input,
+                    num_tokens_per_expert,
+                    top_scores_experts_sorted.reshape(-1),
+                    token_indices_experts_sorted,
+                    int(x.shape[0]),
+                )
+                routed_output_is_scored = routed_output is not None
+                routed_output_is_precombined = (
+                    routed_output_is_scored
+                    and routed_output.dim() == 2
+                    and int(routed_output.shape[0]) == int(x.shape[0])
+                )
+        if routed_output is None:
+            # shape (bs*slen*top_k, dim)
+            routed_output = self.experts(routed_input, num_tokens_per_expert)
 
         # shared expert
         # Note: we execute the shared expert before scoring the output of the routed expert
@@ -2375,7 +2443,15 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x)
 
-        if (
+        if routed_output_is_precombined:
+            out = out + routed_output
+        elif routed_output_is_scored:
+            out = _MoEIndexCombineFunction.apply(
+                out,
+                token_indices_experts_sorted,
+                routed_output,
+            )
+        elif (
             use_indexed_fallback_combine
             and not self.score_before_experts
             and _mxfp4_deepseek_scored_indexed_fallback_combine()

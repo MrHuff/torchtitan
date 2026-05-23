@@ -5,12 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import types
 
 import torch
 import torch.nn as nn
 from torch.distributed._functional_collectives import (
     all_to_all_single,
     all_to_all_single_autograd,
+    reduce_scatter_tensor_autograd,
 )
 from torch.distributed.tensor import (
     DeviceMesh,
@@ -148,6 +150,34 @@ def _lbt_ep_exact_equal_split_a2a() -> bool:
         and degree == "2"
         and mode in ("balanced", "balanced_fast", "fast_balanced")
     )
+
+
+def _lbt_ep_scored_output_combine() -> bool:
+    return _lbt_env_flag("LBT_EP_SCORED_OUTPUT_COMBINE")
+
+
+def _lbt_ep_local_reduce_output_combine() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_OUTPUT_COMBINE")
+
+
+def _lbt_ep_pack_local_reduce_indices() -> bool:
+    return _lbt_env_flag("LBT_EP_PACK_LOCAL_REDUCE_INDICES", True)
+
+
+def _lbt_ep_local_reduce_collective() -> str:
+    value = os.environ.get("LBT_EP_LOCAL_REDUCE_COLLECTIVE", "reduce_scatter")
+    value = value.strip().lower()
+    if value in ("rs", "reduce_scatter", "reducescatter"):
+        return "reduce_scatter"
+    return "all_to_all"
+
+
+def _lbt_ep_score_dispatch_mode() -> str:
+    value = os.environ.get("LBT_EP_SCORE_DISPATCH_MODE", "separate_fp32")
+    value = value.strip().lower()
+    if value in ("pack", "pack_bf16", "cat_bf16"):
+        return "pack_bf16"
+    return "separate_fp32"
 
 
 def _lbt_quantize_fp8_for_a2a(
@@ -607,14 +637,229 @@ class ExpertParallel(ParallelStyle):
         )
         return routed_output
 
+    def _dispatch_like_current_routes(
+        self,
+        tensor: torch.Tensor,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor:
+        if tensor.dim() == 1:
+            tensor = tensor.reshape(-1, 1)
+        routed = _lbt_all_to_all_single_autograd(
+            tensor,
+            None if self._equal_split_a2a else self.output_splits,
+            None if self._equal_split_a2a else self.input_splits,
+            device_mesh.get_group(),
+        )
+        routed = torch.vstack((routed, routed.new_zeros((routed.shape[-1],))))
+        return routed[self.permuted_indices, :]
+
+    def _dispatch_metadata_like_current_routes(
+        self,
+        tensor: torch.Tensor,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor:
+        if tensor.dim() == 1:
+            tensor = tensor.reshape(-1, 1)
+        routed = _lbt_all_to_all_no_autograd(
+            tensor.contiguous(),
+            None if self._equal_split_a2a else self.output_splits,
+            None if self._equal_split_a2a else self.input_splits,
+            device_mesh.get_group(),
+        )
+        routed = torch.vstack((routed, routed.new_zeros((routed.shape[-1],))))
+        return routed[self.permuted_indices, :]
+
+    def _token_combine_local_reduced(
+        self,
+        routed_output: torch.Tensor,
+        local_token_indices: torch.Tensor,
+        num_origin_tokens: int,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor:
+        row_input_shape = (self.input_shape[0], 1)
+        routed_output = _unpermute(
+            routed_output,
+            (self.input_shape[0], routed_output.shape[1]),
+            self.permuted_indices,
+        )
+        local_token_indices = _unpermute(
+            local_token_indices.reshape(-1, 1),
+            row_input_shape,
+            self.permuted_indices,
+        ).reshape(-1)
+
+        ep_degree = int(device_mesh.shape[0])
+        num_origin_tokens = int(num_origin_tokens)
+        global_token_indices = torch.empty_like(local_token_indices)
+        offset = 0
+        for source_rank, split in enumerate(self.output_splits):
+            split = int(split)
+            if split > 0:
+                global_token_indices[offset : offset + split] = (
+                    local_token_indices[offset : offset + split]
+                    + source_rank * num_origin_tokens
+                )
+            offset += split
+
+        reduced = routed_output.new_zeros(
+            (ep_degree * num_origin_tokens, routed_output.shape[1])
+        )
+        reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
+
+        token_splits = [num_origin_tokens for _ in range(ep_degree)]
+        _lbt_debug_ep_splits(
+            "combine_reduced",
+            reduced,
+            token_splits,
+            token_splits,
+            device_mesh,
+        )
+        if _lbt_ep_local_reduce_collective() == "reduce_scatter":
+            return reduce_scatter_tensor_autograd(
+                reduced.contiguous(),
+                "sum",
+                0,
+                device_mesh.get_group(),
+            )
+        partials = _lbt_all_to_all_single_autograd(
+            reduced,
+            token_splits,
+            token_splits,
+            device_mesh.get_group(),
+        )
+        return partials.view(ep_degree, num_origin_tokens, -1).sum(dim=0)
+
+    def _forward_ep_scored_output_combine(
+        self,
+        mod: nn.Module,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        top_scores: torch.Tensor,
+        token_indices: torch.Tensor | None,
+        num_origin_tokens: int | None,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor | None:
+        if not _lbt_ep_scored_output_combine():
+            return None
+        if routed_input.dim() != 2 or top_scores.dim() != 1:
+            return None
+        if int(routed_input.shape[0]) != int(top_scores.numel()):
+            return None
+
+        local_token_indices = None
+        pack_local_reduce_indices = (
+            _lbt_ep_local_reduce_output_combine()
+            and _lbt_ep_pack_local_reduce_indices()
+            and token_indices is not None
+            and num_origin_tokens is not None
+            and int(num_origin_tokens) <= 256 * 256
+            and int(token_indices.numel()) == int(top_scores.numel())
+        )
+        if _lbt_ep_score_dispatch_mode() == "pack_bf16":
+            packed_cols = [routed_input, top_scores.reshape(-1, 1).to(routed_input.dtype)]
+            if pack_local_reduce_indices:
+                token_indices_i64 = token_indices.reshape(-1).to(torch.int64)
+                packed_cols.extend(
+                    (
+                        torch.remainder(token_indices_i64, 256)
+                        .reshape(-1, 1)
+                        .to(routed_input.dtype),
+                        torch.div(token_indices_i64, 256, rounding_mode="floor")
+                        .reshape(-1, 1)
+                        .to(routed_input.dtype),
+                    )
+                )
+            routed_input_and_scores = torch.cat(packed_cols, dim=1)
+            local_input_and_scores, local_counts = self._token_dispatch(
+                mod,
+                (routed_input_and_scores, num_tokens_per_expert),
+                device_mesh,
+            )
+            if pack_local_reduce_indices:
+                local_scores = local_input_and_scores[:, -3:-2].to(torch.float32)
+                local_token_indices = (
+                    local_input_and_scores[:, -2].to(torch.int64)
+                    + local_input_and_scores[:, -1].to(torch.int64) * 256
+                )
+                local_input = local_input_and_scores[:, :-3].contiguous()
+            else:
+                local_scores = local_input_and_scores[:, -1:].to(torch.float32)
+                local_input = local_input_and_scores[:, :-1].contiguous()
+        else:
+            local_input, local_counts = self._token_dispatch(
+                mod,
+                (routed_input, num_tokens_per_expert),
+                device_mesh,
+            )
+            local_scores = self._dispatch_like_current_routes(
+                top_scores.reshape(-1, 1).to(torch.float32),
+                device_mesh,
+            )
+
+        local_output = mod.forward(local_input, local_counts)
+        local_output = (local_output.to(torch.float32) * local_scores).to(
+            local_output.dtype
+        )
+        if (
+            _lbt_ep_local_reduce_output_combine()
+            and token_indices is not None
+            and num_origin_tokens is not None
+        ):
+            if local_token_indices is None:
+                local_token_indices = self._dispatch_metadata_like_current_routes(
+                    token_indices.reshape(-1).to(torch.int64),
+                    device_mesh,
+                )
+            return self._token_combine_local_reduced(
+                local_output,
+                local_token_indices,
+                int(num_origin_tokens),
+                device_mesh,
+            )
+        if _lbt_ep_score_dispatch_mode() == "pack_bf16":
+            self.input_shape = (self.input_shape[0], local_output.shape[1])
+        return self._token_combine(mod, local_output, device_mesh)
+
+    def _attach_scored_output_combine(
+        self,
+        module: nn.Module,
+        device_mesh: DeviceMesh,
+    ) -> None:
+        ep_style = self
+
+        def forward_ep_scored_output_combine(
+            mod: nn.Module,
+            routed_input: torch.Tensor,
+            num_tokens_per_expert: torch.Tensor,
+            top_scores: torch.Tensor,
+            token_indices: torch.Tensor | None = None,
+            num_origin_tokens: int | None = None,
+        ) -> torch.Tensor | None:
+            return ep_style._forward_ep_scored_output_combine(
+                mod,
+                routed_input,
+                num_tokens_per_expert,
+                top_scores,
+                token_indices,
+                num_origin_tokens,
+                device_mesh,
+            )
+
+        module.forward_ep_scored_output_combine = types.MethodType(
+            forward_ep_scored_output_combine,
+            module,
+        )
+
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        return distribute_module(
+        module = distribute_module(
             module,
             device_mesh,
             partition_fn=ExpertParallel._partition_fn,
             input_fn=self._token_dispatch,
             output_fn=self._token_combine,
         )
+        self._attach_scored_output_combine(module, device_mesh)
+        return module
 
 
 # This class is for dp2ep with TP (without TP we can just use ExpertParallel)
