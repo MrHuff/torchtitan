@@ -640,9 +640,18 @@ def _mxfp4_as_contiguous_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torc
 
 
 def _lbt_wait_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.is_cuda:
-        return torch.ops._c10d_functional.wait_tensor(tensor)
-    return tensor
+    if not tensor.is_cuda:
+        return tensor
+    world_size = os.environ.get("WORLD_SIZE")
+    if world_size == "1" or (
+        world_size is None
+        and (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        )
+    ):
+        return tensor
+    return torch.ops._c10d_functional.wait_tensor(tensor)
 
 
 def _lbt_validate_ep_route_counts(counts: torch.Tensor, routes: int) -> None:
@@ -1501,7 +1510,6 @@ class TokenChoiceTopKRouter(nn.Module):
         scores: torch.Tensor,
         expert_bias: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        bias = _lbt_local_tensor(expert_bias) if expert_bias is not None else None
         if (
             not _mxfp4_deepseek_tk_ep2_select_top3()
             or self.top_k != 3
@@ -1511,18 +1519,18 @@ class TokenChoiceTopKRouter(nn.Module):
             or scores.dtype != torch.float32
             or scores.dim() != 2
             or self.num_experts % 2 != 0
-            or (
-                bias is not None
-                and (
-                    not bias.is_cuda
-                    or bias.device != scores.device
-                    or bias.dim() != 1
-                    or bias.numel() != self.num_experts
-                )
-            )
         ):
             return None
-        if _get_mxfp4_moe_ep2_select_top3_balance_scores_fn() is None:
+        bias = _lbt_local_tensor(expert_bias) if expert_bias is not None else None
+        if (
+            bias is not None
+            and (
+                not bias.is_cuda
+                or bias.device != scores.device
+                or bias.dim() != 1
+                or bias.numel() != self.num_experts
+            )
+        ):
             return None
         try:
             return _MXFP4MoEEP2SelectTop3BalanceFunction.apply(
