@@ -172,18 +172,26 @@ def parallelize_deepseekv3(
             dp_mesh_dim_names = ("dp_shard_cp",)
         dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
 
-        if (
-            (
-                _env_flag("LBT_DEEPSEEK_EP_DENSE_DDP")
-                or _env_flag("LBT_DEEPSEEK_EP_DENSE_GRAD_SYNC")
+        dense_ddp_enabled = _env_flag("LBT_DEEPSEEK_EP_DENSE_DDP")
+        dense_grad_sync_enabled = _env_flag("LBT_DEEPSEEK_EP_DENSE_GRAD_SYNC")
+        if dense_grad_sync_enabled and parallel_dims.world_size != parallel_dims.ep:
+            logger.warning(
+                "Ignoring LBT_DEEPSEEK_EP_DENSE_GRAD_SYNC because world_size(%s) "
+                "!= ep(%s); falling back to FSDP for dense parameters",
+                parallel_dims.world_size,
+                parallel_dims.ep,
             )
+            dense_grad_sync_enabled = False
+
+        if (
+            (dense_ddp_enabled or dense_grad_sync_enabled)
             and parallel_dims.ep_enabled
             and not parallel_dims.tp_enabled
             and not parallel_dims.cp_enabled
             and not parallel_dims.pp_enabled
             and not job_config.training.enable_cpu_offload
         ):
-            if _env_flag("LBT_DEEPSEEK_EP_DENSE_DDP"):
+            if dense_ddp_enabled:
                 _apply_ep_dense_ddp(model, dp_mesh)
                 logger.info("Applied EP dense DDP to the model")
             else:
