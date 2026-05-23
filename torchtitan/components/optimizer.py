@@ -9,6 +9,7 @@ from typing import Any, Generic, Iterator, TypeVar
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
@@ -34,6 +35,17 @@ if has_torchft:
 
 
 T = TypeVar("T", bound=Optimizer)
+
+
+def _split_mixed_dtensor_params(
+    params: list[nn.Parameter],
+) -> list[nn.Parameter] | list[dict[str, list[nn.Parameter]]]:
+    dtensor_params = [p for p in params if isinstance(p, DTensor)]
+    if not dtensor_params or len(dtensor_params) == len(params):
+        return params
+
+    local_params = [p for p in params if not isinstance(p, DTensor)]
+    return [{"params": local_params}, {"params": dtensor_params}]
 
 
 class OptimizersContainer(Optimizer, Stateful, Generic[T]):
@@ -76,7 +88,9 @@ class OptimizersContainer(Optimizer, Stateful, Generic[T]):
         self.model_parts = model_parts
         for model in self.model_parts:
             params = [p for p in model.parameters() if p.requires_grad]
-            self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
+            self.optimizers.append(
+                optimizer_cls(_split_mixed_dtensor_params(params), **optimizer_kwargs)
+            )
             all_params.extend(params)
         self._validate_length(len(self.model_parts))
         self._post_init(all_params, optimizer_kwargs)

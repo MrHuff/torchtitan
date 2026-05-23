@@ -4,8 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+
 import torch
 import torch.nn as nn
+from torch.distributed._composable.replicate import replicate
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
@@ -42,6 +45,46 @@ _op_sac_save_list = {
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
 }
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _replicate_if_has_params(module: nn.Module | None, dp_mesh: DeviceMesh) -> None:
+    if module is None:
+        return
+    if any(True for _ in module.parameters(recurse=True)):
+        replicate(module, device_mesh=dp_mesh, bucket_cap_mb=100)
+
+
+def _apply_ep_dense_ddp(model: nn.Module, dp_mesh: DeviceMesh) -> None:
+    _replicate_if_has_params(model.tok_embeddings, dp_mesh)
+    for transformer_block in model.layers.values():
+        _replicate_if_has_params(
+            getattr(transformer_block, "attention_norm", None), dp_mesh
+        )
+        _replicate_if_has_params(
+            getattr(transformer_block, "attention", None), dp_mesh
+        )
+        _replicate_if_has_params(
+            getattr(transformer_block, "ffn_norm", None), dp_mesh
+        )
+        if transformer_block.moe_enabled:
+            moe = getattr(transformer_block, "moe", None)
+            if moe is not None:
+                router = getattr(moe, "router", None)
+                _replicate_if_has_params(getattr(router, "gate", None), dp_mesh)
+                _replicate_if_has_params(getattr(moe, "shared_experts", None), dp_mesh)
+        else:
+            _replicate_if_has_params(
+                getattr(transformer_block, "feed_forward", None), dp_mesh
+            )
+    _replicate_if_has_params(model.norm, dp_mesh)
+    _replicate_if_has_params(model.output, dp_mesh)
 
 
 # Adapted from llama4/infra/parallelize.py
@@ -128,6 +171,24 @@ def parallelize_deepseekv3(
         else:
             dp_mesh_dim_names = ("dp_shard_cp",)
         dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
+
+        if (
+            (
+                _env_flag("LBT_DEEPSEEK_EP_DENSE_DDP")
+                or _env_flag("LBT_DEEPSEEK_EP_DENSE_GRAD_SYNC")
+            )
+            and parallel_dims.ep_enabled
+            and not parallel_dims.tp_enabled
+            and not parallel_dims.cp_enabled
+            and not parallel_dims.pp_enabled
+            and not job_config.training.enable_cpu_offload
+        ):
+            if _env_flag("LBT_DEEPSEEK_EP_DENSE_DDP"):
+                _apply_ep_dense_ddp(model, dp_mesh)
+                logger.info("Applied EP dense DDP to the model")
+            else:
+                logger.info("Applied EP dense local grad sync to the model")
+            return model
 
         # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
         dp_mod_ep_mesh_dim_names = []

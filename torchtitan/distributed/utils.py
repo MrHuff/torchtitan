@@ -23,6 +23,39 @@ from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module, device_type
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_local_grads_for_ep(local_grads: list[torch.Tensor]) -> None:
+    if not _env_flag("LBT_DEEPSEEK_EP_DENSE_GRAD_SYNC"):
+        return
+    if _env_flag("LBT_DEEPSEEK_EP_DENSE_DDP"):
+        return
+    if not local_grads or not dist.is_available() or not dist.is_initialized():
+        return
+
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return
+
+    grouped_grads: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    for grad in local_grads:
+        grouped_grads.setdefault((grad.device, grad.dtype), []).append(grad.detach())
+
+    for grads in grouped_grads.values():
+        flat_grad = torch._utils._flatten_dense_tensors(grads)
+        dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
+        flat_grad.div_(world_size)
+        for synced_grad, grad in zip(
+            torch._utils._unflatten_dense_tensors(flat_grad, grads), grads
+        ):
+            grad.copy_(synced_grad)
+
+
 def _dist_reduce(
     x: torch.Tensor,
     reduceOp: str,
@@ -425,19 +458,28 @@ def _clip_grad_norm_with_ep(
 ) -> torch.Tensor:
     ep_params = []
     non_ep_params = []
+    local_params = []
     ep_grads = []
     non_ep_grads = []
+    local_grads = []
 
     for p in parameters:
         if p.grad is None:
             continue
-        assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
+        if not isinstance(p, DTensor):
+            local_params.append(p)
+            local_grads.append(p.grad)
+            continue
+        assert isinstance(p.grad, DTensor)
         if "ep" in p.device_mesh.mesh_dim_names:
             ep_params.append(p)
             ep_grads.append(p.grad)
         else:
             non_ep_params.append(p)
             non_ep_grads.append(p.grad)
+
+    _sync_local_grads_for_ep(local_grads)
+
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
         ep_grads, norm_type, error_if_nonfinite, foreach
     )
@@ -446,15 +488,29 @@ def _clip_grad_norm_with_ep(
     if isinstance(ep_grads_total_norm, DTensor):
         ep_grads_total_norm = ep_grads_total_norm.full_tensor()
 
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        non_ep_grads, norm_type, error_if_nonfinite, foreach
-    ).full_tensor()
+    if non_ep_grads:
+        non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
+            non_ep_grads, norm_type, error_if_nonfinite, foreach
+        ).full_tensor()
+    else:
+        non_ep_grads_total_norm = torch.zeros_like(ep_grads_total_norm)
+
+    if local_grads:
+        local_grads_total_norm = torch.nn.utils.get_total_norm(
+            local_grads, norm_type, error_if_nonfinite, foreach
+        ).to(device=ep_grads_total_norm.device)
+    else:
+        local_grads_total_norm = torch.zeros_like(ep_grads_total_norm)
 
     if math.isinf(norm_type):
-        total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
+        total_norm = torch.maximum(
+            torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm),
+            local_grads_total_norm,
+        )
     else:
         total_norm = (
             ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
+            + local_grads_total_norm**norm_type
         )
         total_norm **= 1.0 / norm_type
 
@@ -468,5 +524,6 @@ def _clip_grad_norm_with_ep(
 
     torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
     torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
+    torch.nn.utils.clip_grads_with_norm_(local_params, max_norm, total_norm, foreach)
 
     return total_norm
