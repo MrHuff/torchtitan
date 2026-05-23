@@ -45,7 +45,9 @@ def _lbt_ep_debug_split_limit() -> int:
 
 
 def _lbt_ep_split_count_all_gather() -> bool:
-    return _lbt_env_flag("LBT_EP_SPLIT_COUNT_ALL_GATHER", False)
+    if "LBT_EP_SPLIT_COUNT_ALL_GATHER" in os.environ:
+        return _lbt_env_flag("LBT_EP_SPLIT_COUNT_ALL_GATHER", False)
+    return _lbt_ep_exact_equal_split_a2a()
 
 
 def _lbt_split_stats(splits: list[int]) -> tuple[int, int, float]:
