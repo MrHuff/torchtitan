@@ -32,6 +32,10 @@ from torchtitan.models.moe.utils import _permute, _unpermute
 _LBT_EP_DEBUG_SPLIT_COUNT = 0
 _LBT_MOE_SCATTER_ADD_BF16 = None
 _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = False
+_LBT_MOE_SCALE_SCATTER_ADD_BF16 = None
+_LBT_MOE_SCALE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = False
+_LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16 = None
+_LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16_IMPORT_ATTEMPTED = False
 
 
 def _lbt_env_flag(name: str, default: bool = False) -> bool:
@@ -212,6 +216,10 @@ def _lbt_ep_local_reduce_tk_scatter_add() -> bool:
     return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_TK_SCATTER_ADD")
 
 
+def _lbt_ep_local_reduce_fused_score_scatter() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_FUSED_SCORE_SCATTER")
+
+
 def _lbt_get_moe_scatter_add_bf16():
     global _LBT_MOE_SCATTER_ADD_BF16, _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED
     if not _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED:
@@ -227,31 +235,158 @@ def _lbt_get_moe_scatter_add_bf16():
     return _LBT_MOE_SCATTER_ADD_BF16
 
 
-def _lbt_local_reduce_index_add_(
-    reduced: torch.Tensor,
-    global_token_indices: torch.Tensor,
+def _lbt_get_moe_scale_scatter_add_bf16():
+    global _LBT_MOE_SCALE_SCATTER_ADD_BF16
+    global _LBT_MOE_SCALE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED
+    if not _LBT_MOE_SCALE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED:
+        _LBT_MOE_SCALE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_scale_scatter_add_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_SCALE_SCATTER_ADD_BF16 = None
+        else:
+            _LBT_MOE_SCALE_SCATTER_ADD_BF16 = mxfp4_moe_scale_scatter_add_bf16
+    return _LBT_MOE_SCALE_SCATTER_ADD_BF16
+
+
+def _lbt_get_moe_indexed_scale_dot_rows_bf16():
+    global _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16
+    global _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16_IMPORT_ATTEMPTED
+    if not _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16_IMPORT_ATTEMPTED:
+        _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_indexed_scale_dot_rows_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16 = None
+        else:
+            _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16 = (
+                mxfp4_moe_indexed_scale_dot_rows_bf16
+            )
+    return _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16
+
+
+class _LBTLocalReduceScatterAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        global_token_indices: torch.Tensor,
+        output_rows: int,
+    ) -> torch.Tensor:
+        indices = global_token_indices.to(torch.int64).contiguous()
+        routed_output = routed_output.contiguous()
+        reduced = routed_output.new_zeros((int(output_rows), routed_output.shape[1]))
+        scatter_add_fn = _lbt_get_moe_scatter_add_bf16()
+        if scatter_add_fn is None:
+            reduced.index_add_(0, indices, routed_output)
+        else:
+            scatter_add_fn(routed_output, indices, reduced)
+        ctx.save_for_backward(indices)
+        return reduced
+
+    @staticmethod
+    def backward(ctx, grad_reduced: torch.Tensor):
+        (indices,) = ctx.saved_tensors
+        grad_routed = grad_reduced.contiguous().index_select(0, indices)
+        return grad_routed, None, None
+
+
+class _LBTLocalReduceScaleScatterAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        scores: torch.Tensor,
+        global_token_indices: torch.Tensor,
+        output_rows: int,
+    ) -> torch.Tensor:
+        indices = global_token_indices.to(torch.int64).contiguous()
+        routed_output = routed_output.contiguous()
+        scores = scores.reshape(-1).to(torch.float32).contiguous()
+        reduced = routed_output.new_zeros((int(output_rows), routed_output.shape[1]))
+        scale_scatter_fn = _lbt_get_moe_scale_scatter_add_bf16()
+        if scale_scatter_fn is None:
+            scaled = (routed_output.to(torch.float32) * scores.reshape(-1, 1)).to(
+                routed_output.dtype
+            )
+            reduced.index_add_(0, indices, scaled)
+        else:
+            scale_scatter_fn(routed_output, scores, indices, reduced)
+        ctx.save_for_backward(indices, routed_output, scores)
+        return reduced
+
+    @staticmethod
+    def backward(ctx, grad_reduced: torch.Tensor):
+        indices, routed_output, scores = ctx.saved_tensors
+        grad_reduced = grad_reduced.contiguous()
+        fused_bwd_fn = _lbt_get_moe_indexed_scale_dot_rows_bf16()
+        if (
+            fused_bwd_fn is not None
+            and grad_reduced.is_cuda
+            and routed_output.is_cuda
+            and grad_reduced.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            try:
+                grad_routed, grad_scores = fused_bwd_fn(
+                    grad_reduced,
+                    indices,
+                    routed_output,
+                    scores,
+                )
+                return grad_routed, grad_scores.reshape(-1), None, None
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                pass
+
+        grad_selected = grad_reduced.index_select(0, indices)
+        grad_routed = (grad_selected.to(torch.float32) * scores.reshape(-1, 1)).to(
+            routed_output.dtype
+        )
+        grad_scores = (
+            grad_selected.to(torch.float32) * routed_output.to(torch.float32)
+        ).sum(dim=1)
+        return grad_routed, grad_scores.reshape(-1), None, None
+
+
+def _lbt_local_reduce_index_add(
     routed_output: torch.Tensor,
-) -> None:
+    global_token_indices: torch.Tensor,
+    output_rows: int,
+    scores: torch.Tensor | None = None,
+) -> torch.Tensor:
     if (
         _lbt_ep_local_reduce_tk_scatter_add()
-        and reduced.is_cuda
         and routed_output.is_cuda
         and global_token_indices.is_cuda
-        and reduced.dtype == torch.bfloat16
         and routed_output.dtype == torch.bfloat16
     ):
-        scatter_add_fn = _lbt_get_moe_scatter_add_bf16()
-        if scatter_add_fn is not None:
-            try:
-                scatter_add_fn(
-                    routed_output.contiguous(),
-                    global_token_indices.to(torch.int64).contiguous(),
-                    reduced,
+        try:
+            if scores is not None:
+                return _LBTLocalReduceScaleScatterAdd.apply(
+                    routed_output,
+                    scores,
+                    global_token_indices,
+                    int(output_rows),
                 )
-                return
-            except (AttributeError, FileNotFoundError, ImportError):
-                pass
+            return _LBTLocalReduceScatterAdd.apply(
+                routed_output,
+                global_token_indices,
+                int(output_rows),
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            pass
+
+    reduced = routed_output.new_zeros((int(output_rows), routed_output.shape[1]))
+    if scores is not None:
+        routed_output = (
+            routed_output.to(torch.float32) * scores.reshape(-1, 1).to(torch.float32)
+        ).to(routed_output.dtype)
     reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
+    return reduced
 
 
 def _lbt_quantize_fp8_for_a2a(
@@ -841,6 +976,7 @@ class ExpertParallel(ParallelStyle):
         source_token_indices: torch.Tensor | None,
         num_origin_tokens: int,
         device_mesh: DeviceMesh,
+        local_scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ep_degree = int(device_mesh.shape[0])
         num_origin_tokens = int(num_origin_tokens)
@@ -868,13 +1004,11 @@ class ExpertParallel(ParallelStyle):
             source_offsets = source_offsets[self.permuted_indices]
             global_token_indices = local_token_indices.reshape(-1) + source_offsets
 
-            reduced = routed_output.new_zeros(
-                (ep_degree * num_origin_tokens, routed_output.shape[1])
-            )
-            _lbt_local_reduce_index_add_(
-                reduced,
-                global_token_indices,
+            reduced = _lbt_local_reduce_index_add(
                 routed_output,
+                global_token_indices,
+                ep_degree * num_origin_tokens,
+                local_scores,
             )
 
             token_splits = [num_origin_tokens for _ in range(ep_degree)]
@@ -911,6 +1045,12 @@ class ExpertParallel(ParallelStyle):
             row_input_shape,
             self.permuted_indices,
         ).reshape(-1)
+        if local_scores is not None:
+            local_scores = _unpermute(
+                local_scores.reshape(-1, 1),
+                row_input_shape,
+                self.permuted_indices,
+            ).reshape(-1)
 
         if (
             _lbt_ep_local_reduce_collective() == "reduce_scatter"
@@ -918,6 +1058,11 @@ class ExpertParallel(ParallelStyle):
             and source_token_indices is not None
             and int(source_token_indices.numel()) == sum(self.input_splits)
         ):
+            if local_scores is not None:
+                routed_output = (
+                    routed_output.to(torch.float32)
+                    * local_scores.reshape(-1, 1).to(torch.float32)
+                ).to(routed_output.dtype)
             return _LBTLocalReduceCombine.apply(
                 routed_output,
                 local_token_indices,
@@ -939,13 +1084,11 @@ class ExpertParallel(ParallelStyle):
                 )
             offset += split
 
-        reduced = routed_output.new_zeros(
-            (ep_degree * num_origin_tokens, routed_output.shape[1])
-        )
-        _lbt_local_reduce_index_add_(
-            reduced,
-            global_token_indices,
+        reduced = _lbt_local_reduce_index_add(
             routed_output,
+            global_token_indices,
+            ep_degree * num_origin_tokens,
+            local_scores,
         )
 
         token_splits = [num_origin_tokens for _ in range(ep_degree)]
@@ -1045,9 +1188,12 @@ class ExpertParallel(ParallelStyle):
             ).to(torch.float32)
 
         local_output = mod.forward(local_input, local_counts)
-        local_output = (local_output.to(torch.float32) * local_scores).to(
-            local_output.dtype
-        )
+        reduce_scores = local_scores.reshape(-1)
+        if not _lbt_ep_local_reduce_fused_score_scatter():
+            local_output = (local_output.to(torch.float32) * local_scores).to(
+                local_output.dtype
+            )
+            reduce_scores = None
         if (
             _lbt_ep_local_reduce_output_combine()
             and token_indices is not None
@@ -1069,7 +1215,15 @@ class ExpertParallel(ParallelStyle):
                 token_indices.reshape(-1),
                 int(num_origin_tokens),
                 device_mesh,
+                reduce_scores,
             )
+        if reduce_scores is None:
+            if score_dispatch_mode == "pack_bf16":
+                self.input_shape = (self.input_shape[0], local_output.shape[1])
+            return self._token_combine(mod, local_output, device_mesh)
+        local_output = (local_output.to(torch.float32) * local_scores).to(
+            local_output.dtype
+        )
         if score_dispatch_mode == "pack_bf16":
             self.input_shape = (self.input_shape[0], local_output.shape[1])
         return self._token_combine(mod, local_output, device_mesh)
