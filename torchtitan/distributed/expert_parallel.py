@@ -802,8 +802,9 @@ class ExpertParallel(ParallelStyle):
             and int(local_token_indices.numel()) == int(routed_output.shape[0])
             and int(self.permuted_indices.numel()) == int(routed_output.shape[0])
         ):
+            num_routed_rows = sum(self.output_splits)
             source_offsets = torch.empty(
-                sum(self.output_splits),
+                num_routed_rows + 1,
                 device=local_token_indices.device,
                 dtype=local_token_indices.dtype,
             )
@@ -815,9 +816,8 @@ class ExpertParallel(ParallelStyle):
                         source_rank * num_origin_tokens
                     )
                 offset += split
-            source_offsets = torch.cat(
-                (source_offsets, source_offsets.new_zeros((1,)))
-            )[self.permuted_indices]
+            source_offsets[num_routed_rows] = 0
+            source_offsets = source_offsets[self.permuted_indices]
             global_token_indices = local_token_indices.reshape(-1) + source_offsets
 
             reduced = routed_output.new_zeros(
