@@ -172,6 +172,10 @@ def _lbt_ep_local_reduce_collective() -> str:
     return "all_to_all"
 
 
+def _lbt_ep_local_reduce_a2a_bwd() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_A2A_BWD")
+
+
 def _lbt_ep_score_dispatch_mode() -> str:
     value = os.environ.get("LBT_EP_SCORE_DISPATCH_MODE", "separate_fp32")
     value = value.strip().lower()
@@ -317,6 +321,71 @@ class _LBTCompressedAllToAll(torch.autograd.Function):
             ctx.backward_mode,
         )
         return grad_input, None, None, None, None, None
+
+
+# Diagnostic local-reduce variant: keep the reduce-scatter forward, but route
+# only needed output gradients back to expert ranks instead of all-gathering the
+# full per-token gradient. This is opt-in because the smaller backward A2A is
+# topology-sensitive in full-model runs.
+class _LBTLocalReduceCombine(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        local_token_indices: torch.Tensor,
+        source_token_indices: torch.Tensor,
+        input_splits: list[int],
+        output_splits: list[int],
+        num_origin_tokens: int,
+        group,
+    ) -> torch.Tensor:
+        input_splits = [int(split) for split in input_splits]
+        output_splits = [int(split) for split in output_splits]
+        num_origin_tokens = int(num_origin_tokens)
+        ep_degree = len(input_splits)
+
+        global_token_indices = torch.empty_like(local_token_indices)
+        offset = 0
+        for source_rank, split in enumerate(output_splits):
+            split = int(split)
+            if split > 0:
+                global_token_indices[offset : offset + split] = (
+                    local_token_indices[offset : offset + split]
+                    + source_rank * num_origin_tokens
+                )
+            offset += split
+
+        reduced = routed_output.new_zeros(
+            (ep_degree * num_origin_tokens, routed_output.shape[1])
+        )
+        reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
+        output = reduce_scatter_tensor_autograd(
+            reduced.contiguous(),
+            "sum",
+            0,
+            group,
+        )
+
+        ctx.save_for_backward(source_token_indices)
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group = group
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (source_token_indices,) = ctx.saved_tensors
+        send_grad = grad_output.contiguous().index_select(
+            0,
+            source_token_indices.to(torch.int64),
+        )
+        grad_routed_output = _lbt_all_to_all_no_autograd(
+            send_grad,
+            ctx.output_splits,
+            ctx.input_splits,
+            ctx.group,
+        )
+        return grad_routed_output, None, None, None, None, None, None
 
 
 def _lbt_all_to_all_single_autograd(
@@ -673,6 +742,7 @@ class ExpertParallel(ParallelStyle):
         self,
         routed_output: torch.Tensor,
         local_token_indices: torch.Tensor,
+        source_token_indices: torch.Tensor | None,
         num_origin_tokens: int,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
@@ -690,6 +760,22 @@ class ExpertParallel(ParallelStyle):
 
         ep_degree = int(device_mesh.shape[0])
         num_origin_tokens = int(num_origin_tokens)
+        if (
+            _lbt_ep_local_reduce_collective() == "reduce_scatter"
+            and _lbt_ep_local_reduce_a2a_bwd()
+            and source_token_indices is not None
+            and int(source_token_indices.numel()) == sum(self.input_splits)
+        ):
+            return _LBTLocalReduceCombine.apply(
+                routed_output,
+                local_token_indices,
+                source_token_indices.reshape(-1).to(torch.int64).contiguous(),
+                self.input_splits,
+                self.output_splits,
+                num_origin_tokens,
+                device_mesh.get_group(),
+            )
+
         global_token_indices = torch.empty_like(local_token_indices)
         offset = 0
         for source_rank, split in enumerate(self.output_splits):
@@ -813,6 +899,7 @@ class ExpertParallel(ParallelStyle):
             return self._token_combine_local_reduced(
                 local_output,
                 local_token_indices,
+                token_indices.reshape(-1),
                 int(num_origin_tokens),
                 device_mesh,
             )
