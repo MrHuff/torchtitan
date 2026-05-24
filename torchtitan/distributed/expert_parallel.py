@@ -202,6 +202,10 @@ def _lbt_ep_local_reduce_index_dtype() -> str:
     return "int64"
 
 
+def _lbt_ep_local_reduce_permuted() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_PERMUTED")
+
+
 def _lbt_quantize_fp8_for_a2a(
     tensor: torch.Tensor,
     mode: str,
@@ -790,6 +794,60 @@ class ExpertParallel(ParallelStyle):
         num_origin_tokens: int,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        ep_degree = int(device_mesh.shape[0])
+        num_origin_tokens = int(num_origin_tokens)
+        if (
+            _lbt_ep_local_reduce_permuted()
+            and not _lbt_ep_local_reduce_a2a_bwd()
+            and int(local_token_indices.numel()) == int(routed_output.shape[0])
+            and int(self.permuted_indices.numel()) == int(routed_output.shape[0])
+        ):
+            source_offsets = torch.empty(
+                sum(self.output_splits),
+                device=local_token_indices.device,
+                dtype=local_token_indices.dtype,
+            )
+            offset = 0
+            for source_rank, split in enumerate(self.output_splits):
+                split = int(split)
+                if split > 0:
+                    source_offsets[offset : offset + split] = (
+                        source_rank * num_origin_tokens
+                    )
+                offset += split
+            source_offsets = torch.cat(
+                (source_offsets, source_offsets.new_zeros((1,)))
+            )[self.permuted_indices]
+            global_token_indices = local_token_indices.reshape(-1) + source_offsets
+
+            reduced = routed_output.new_zeros(
+                (ep_degree * num_origin_tokens, routed_output.shape[1])
+            )
+            reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
+
+            token_splits = [num_origin_tokens for _ in range(ep_degree)]
+            _lbt_debug_ep_splits(
+                "combine_reduced_permuted",
+                reduced,
+                token_splits,
+                token_splits,
+                device_mesh,
+            )
+            if _lbt_ep_local_reduce_collective() == "reduce_scatter":
+                return reduce_scatter_tensor_autograd(
+                    reduced.contiguous(),
+                    "sum",
+                    0,
+                    device_mesh.get_group(),
+                )
+            partials = _lbt_all_to_all_single_autograd(
+                reduced,
+                token_splits,
+                token_splits,
+                device_mesh.get_group(),
+            )
+            return partials.view(ep_degree, num_origin_tokens, -1).sum(dim=0)
+
         row_input_shape = (self.input_shape[0], 1)
         routed_output = _unpermute(
             routed_output,
@@ -802,8 +860,6 @@ class ExpertParallel(ParallelStyle):
             self.permuted_indices,
         ).reshape(-1)
 
-        ep_degree = int(device_mesh.shape[0])
-        num_origin_tokens = int(num_origin_tokens)
         if (
             _lbt_ep_local_reduce_collective() == "reduce_scatter"
             and _lbt_ep_local_reduce_a2a_bwd()
