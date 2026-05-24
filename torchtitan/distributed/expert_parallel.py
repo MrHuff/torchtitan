@@ -176,6 +176,14 @@ def _lbt_ep_local_reduce_a2a_bwd() -> bool:
     return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_A2A_BWD")
 
 
+def _lbt_ep_local_reduce_a2a_bwd_mode() -> str:
+    value = os.environ.get("LBT_EP_LOCAL_REDUCE_A2A_BWD_MODE", "tokens")
+    value = value.strip().lower()
+    if value in ("route", "routes", "routed"):
+        return "routes"
+    return "tokens"
+
+
 def _lbt_ep_score_dispatch_mode() -> str:
     value = os.environ.get("LBT_EP_SCORE_DISPATCH_MODE", "separate_fp32")
     value = value.strip().lower()
@@ -323,10 +331,9 @@ class _LBTCompressedAllToAll(torch.autograd.Function):
         return grad_input, None, None, None, None, None
 
 
-# Diagnostic local-reduce variant: keep the reduce-scatter forward, but route
-# only needed output gradients back to expert ranks instead of all-gathering the
-# full per-token gradient. This is opt-in because the smaller backward A2A is
-# topology-sensitive in full-model runs.
+# Diagnostic local-reduce variant: keep the reduce-scatter forward, but use a
+# custom backward to compare token-granular A2A against the default all-gather.
+# A routes mode is retained for diagnostics, but it sends top_k-expanded rows.
 class _LBTLocalReduceCombine(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -366,25 +373,52 @@ class _LBTLocalReduceCombine(torch.autograd.Function):
             group,
         )
 
-        ctx.save_for_backward(source_token_indices)
+        ctx.save_for_backward(local_token_indices, source_token_indices)
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
+        ctx.num_origin_tokens = num_origin_tokens
+        ctx.backward_mode = _lbt_ep_local_reduce_a2a_bwd_mode()
         ctx.group = group
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        (source_token_indices,) = ctx.saved_tensors
-        send_grad = grad_output.contiguous().index_select(
-            0,
-            source_token_indices.to(torch.int64),
-        )
-        grad_routed_output = _lbt_all_to_all_no_autograd(
-            send_grad,
-            ctx.output_splits,
-            ctx.input_splits,
-            ctx.group,
-        )
+        local_token_indices, source_token_indices = ctx.saved_tensors
+        if ctx.backward_mode == "routes":
+            send_grad = grad_output.contiguous().index_select(
+                0,
+                source_token_indices.to(torch.int64),
+            )
+            grad_routed_output = _lbt_all_to_all_no_autograd(
+                send_grad,
+                ctx.output_splits,
+                ctx.input_splits,
+                ctx.group,
+            )
+        else:
+            ep_degree = len(ctx.input_splits)
+            token_splits = [int(ctx.num_origin_tokens) for _ in range(ep_degree)]
+            send_grad = grad_output.contiguous().repeat(ep_degree, 1)
+            gathered_grad = _lbt_all_to_all_no_autograd(
+                send_grad,
+                token_splits,
+                token_splits,
+                ctx.group,
+            )
+            global_token_indices = torch.empty_like(local_token_indices)
+            offset = 0
+            for source_rank, split in enumerate(ctx.output_splits):
+                split = int(split)
+                if split > 0:
+                    global_token_indices[offset : offset + split] = (
+                        local_token_indices[offset : offset + split]
+                        + source_rank * int(ctx.num_origin_tokens)
+                    )
+                offset += split
+            grad_routed_output = gathered_grad.index_select(
+                0,
+                global_token_indices.to(torch.int64),
+            )
         return grad_routed_output, None, None, None, None, None, None
 
 
