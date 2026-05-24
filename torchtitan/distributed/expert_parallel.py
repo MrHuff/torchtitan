@@ -189,7 +189,17 @@ def _lbt_ep_score_dispatch_mode() -> str:
     value = value.strip().lower()
     if value in ("pack", "pack_bf16", "cat_bf16"):
         return "pack_bf16"
+    if value in ("separate_bf16", "bf16"):
+        return "separate_bf16"
     return "separate_fp32"
+
+
+def _lbt_ep_local_reduce_index_dtype() -> str:
+    value = os.environ.get("LBT_EP_LOCAL_REDUCE_INDEX_DTYPE", "int64")
+    value = value.strip().lower()
+    if value in ("auto", "int32", "i32", "32"):
+        return "auto"
+    return "int64"
 
 
 def _lbt_quantize_fp8_for_a2a(
@@ -875,7 +885,8 @@ class ExpertParallel(ParallelStyle):
             and int(num_origin_tokens) <= 256 * 256
             and int(token_indices.numel()) == int(top_scores.numel())
         )
-        if _lbt_ep_score_dispatch_mode() == "pack_bf16":
+        score_dispatch_mode = _lbt_ep_score_dispatch_mode()
+        if score_dispatch_mode == "pack_bf16":
             packed_cols = [routed_input, top_scores.reshape(-1, 1).to(routed_input.dtype)]
             if pack_local_reduce_indices:
                 token_indices_i64 = token_indices.reshape(-1).to(torch.int64)
@@ -911,10 +922,15 @@ class ExpertParallel(ParallelStyle):
                 (routed_input, num_tokens_per_expert),
                 device_mesh,
             )
-            local_scores = self._dispatch_like_current_routes(
-                top_scores.reshape(-1, 1).to(torch.float32),
-                device_mesh,
+            score_dtype = (
+                routed_input.dtype
+                if score_dispatch_mode == "separate_bf16"
+                else torch.float32
             )
+            local_scores = self._dispatch_like_current_routes(
+                top_scores.reshape(-1, 1).to(score_dtype),
+                device_mesh,
+            ).to(torch.float32)
 
         local_output = mod.forward(local_input, local_counts)
         local_output = (local_output.to(torch.float32) * local_scores).to(
@@ -926,8 +942,13 @@ class ExpertParallel(ParallelStyle):
             and num_origin_tokens is not None
         ):
             if local_token_indices is None:
+                index_dtype = torch.int64
+                if _lbt_ep_local_reduce_index_dtype() == "auto":
+                    max_global_index = int(device_mesh.shape[0]) * int(num_origin_tokens)
+                    if max_global_index <= torch.iinfo(torch.int32).max:
+                        index_dtype = torch.int32
                 local_token_indices = self._dispatch_metadata_like_current_routes(
-                    token_indices.reshape(-1).to(torch.int64),
+                    token_indices.reshape(-1).to(index_dtype),
                     device_mesh,
                 )
             return self._token_combine_local_reduced(
@@ -937,7 +958,7 @@ class ExpertParallel(ParallelStyle):
                 int(num_origin_tokens),
                 device_mesh,
             )
-        if _lbt_ep_score_dispatch_mode() == "pack_bf16":
+        if score_dispatch_mode == "pack_bf16":
             self.input_shape = (self.input_shape[0], local_output.shape[1])
         return self._token_combine(mod, local_output, device_mesh)
 
