@@ -30,6 +30,8 @@ from torchtitan.models.moe.utils import _permute, _unpermute
 
 
 _LBT_EP_DEBUG_SPLIT_COUNT = 0
+_LBT_MOE_SCATTER_ADD_BF16 = None
+_LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = False
 
 
 def _lbt_env_flag(name: str, default: bool = False) -> bool:
@@ -204,6 +206,52 @@ def _lbt_ep_local_reduce_index_dtype() -> str:
 
 def _lbt_ep_local_reduce_permuted() -> bool:
     return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_PERMUTED")
+
+
+def _lbt_ep_local_reduce_tk_scatter_add() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_TK_SCATTER_ADD")
+
+
+def _lbt_get_moe_scatter_add_bf16():
+    global _LBT_MOE_SCATTER_ADD_BF16, _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED
+    if not _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED:
+        _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_scatter_add_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_SCATTER_ADD_BF16 = None
+        else:
+            _LBT_MOE_SCATTER_ADD_BF16 = mxfp4_moe_scatter_add_bf16
+    return _LBT_MOE_SCATTER_ADD_BF16
+
+
+def _lbt_local_reduce_index_add_(
+    reduced: torch.Tensor,
+    global_token_indices: torch.Tensor,
+    routed_output: torch.Tensor,
+) -> None:
+    if (
+        _lbt_ep_local_reduce_tk_scatter_add()
+        and reduced.is_cuda
+        and routed_output.is_cuda
+        and global_token_indices.is_cuda
+        and reduced.dtype == torch.bfloat16
+        and routed_output.dtype == torch.bfloat16
+    ):
+        scatter_add_fn = _lbt_get_moe_scatter_add_bf16()
+        if scatter_add_fn is not None:
+            try:
+                scatter_add_fn(
+                    routed_output.contiguous(),
+                    global_token_indices.to(torch.int64).contiguous(),
+                    reduced,
+                )
+                return
+            except (AttributeError, FileNotFoundError, ImportError):
+                pass
+    reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
 
 
 def _lbt_quantize_fp8_for_a2a(
@@ -823,7 +871,11 @@ class ExpertParallel(ParallelStyle):
             reduced = routed_output.new_zeros(
                 (ep_degree * num_origin_tokens, routed_output.shape[1])
             )
-            reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
+            _lbt_local_reduce_index_add_(
+                reduced,
+                global_token_indices,
+                routed_output,
+            )
 
             token_splits = [num_origin_tokens for _ in range(ep_degree)]
             _lbt_debug_ep_splits(
@@ -890,7 +942,11 @@ class ExpertParallel(ParallelStyle):
         reduced = routed_output.new_zeros(
             (ep_degree * num_origin_tokens, routed_output.shape[1])
         )
-        reduced.index_add_(0, global_token_indices.to(torch.int64), routed_output)
+        _lbt_local_reduce_index_add_(
+            reduced,
+            global_token_indices,
+            routed_output,
+        )
 
         token_splits = [num_origin_tokens for _ in range(ep_degree)]
         _lbt_debug_ep_splits(
