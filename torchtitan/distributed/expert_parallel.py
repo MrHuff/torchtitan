@@ -453,6 +453,24 @@ def _lbt_local_reduce_index_add(
     output_rows: int,
     scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if (
+        scores is not None
+        and _lbt_ep_local_reduce_tk_scatter_add()
+        and _lbt_ep_local_reduce_fused_score_scatter()
+        and routed_output.is_cuda
+        and global_token_indices.is_cuda
+        and routed_output.dtype == torch.bfloat16
+    ):
+        try:
+            return _LBTLocalReduceScaleScatterAdd.apply(
+                routed_output,
+                scores,
+                global_token_indices,
+                int(output_rows),
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            pass
+
     if scores is not None and _lbt_ep_local_reduce_fused_score_bwd():
         try:
             return _LBTLocalReduceScaleIndexAdd.apply(
@@ -471,13 +489,6 @@ def _lbt_local_reduce_index_add(
         and routed_output.dtype == torch.bfloat16
     ):
         try:
-            if scores is not None and _lbt_ep_local_reduce_fused_score_scatter():
-                return _LBTLocalReduceScaleScatterAdd.apply(
-                    routed_output,
-                    scores,
-                    global_token_indices,
-                    int(output_rows),
-                )
             if scores is None:
                 return _LBTLocalReduceScatterAdd.apply(
                     routed_output,
