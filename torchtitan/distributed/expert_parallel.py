@@ -34,6 +34,8 @@ _LBT_MOE_SCATTER_ADD_BF16 = None
 _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = False
 _LBT_MOE_SCALE_SCATTER_ADD_BF16 = None
 _LBT_MOE_SCALE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED = False
+_LBT_MOE_SCALE_ROWS_BF16 = None
+_LBT_MOE_SCALE_ROWS_BF16_IMPORT_ATTEMPTED = False
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16 = None
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16_IMPORT_ATTEMPTED = False
 
@@ -224,6 +226,10 @@ def _lbt_ep_local_reduce_fused_score_bwd() -> bool:
     return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_FUSED_SCORE_BWD")
 
 
+def _lbt_ep_local_reduce_fused_scale_rows() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_FUSED_SCALE_ROWS")
+
+
 def _lbt_get_moe_scatter_add_bf16():
     global _LBT_MOE_SCATTER_ADD_BF16, _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED
     if not _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED:
@@ -253,6 +259,22 @@ def _lbt_get_moe_scale_scatter_add_bf16():
         else:
             _LBT_MOE_SCALE_SCATTER_ADD_BF16 = mxfp4_moe_scale_scatter_add_bf16
     return _LBT_MOE_SCALE_SCATTER_ADD_BF16
+
+
+def _lbt_get_moe_scale_rows_bf16():
+    global _LBT_MOE_SCALE_ROWS_BF16
+    global _LBT_MOE_SCALE_ROWS_BF16_IMPORT_ATTEMPTED
+    if not _LBT_MOE_SCALE_ROWS_BF16_IMPORT_ATTEMPTED:
+        _LBT_MOE_SCALE_ROWS_BF16_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_scale_rows_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_SCALE_ROWS_BF16 = None
+        else:
+            _LBT_MOE_SCALE_ROWS_BF16 = mxfp4_moe_scale_rows_bf16
+    return _LBT_MOE_SCALE_ROWS_BF16
 
 
 def _lbt_get_moe_indexed_scale_dot_rows_bf16():
@@ -369,9 +391,23 @@ class _LBTLocalReduceScaleIndexAdd(torch.autograd.Function):
         indices = global_token_indices.to(torch.int64).contiguous()
         routed_output = routed_output.contiguous()
         scores = scores.reshape(-1).to(torch.float32).contiguous()
-        scaled = (routed_output.to(torch.float32) * scores.reshape(-1, 1)).to(
-            routed_output.dtype
-        )
+        scaled = None
+        if (
+            _lbt_ep_local_reduce_fused_scale_rows()
+            and routed_output.is_cuda
+            and scores.is_cuda
+            and routed_output.dtype == torch.bfloat16
+        ):
+            scale_rows_fn = _lbt_get_moe_scale_rows_bf16()
+            if scale_rows_fn is not None:
+                try:
+                    scaled = scale_rows_fn(routed_output, scores)
+                except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                    scaled = None
+        if scaled is None:
+            scaled = (routed_output.to(torch.float32) * scores.reshape(-1, 1)).to(
+                routed_output.dtype
+            )
         reduced = routed_output.new_zeros((int(output_rows), routed_output.shape[1]))
         reduced.index_add_(0, indices, scaled)
         _lbt_get_moe_indexed_scale_dot_rows_bf16()
