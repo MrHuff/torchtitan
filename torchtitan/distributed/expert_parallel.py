@@ -220,6 +220,10 @@ def _lbt_ep_local_reduce_fused_score_scatter() -> bool:
     return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_FUSED_SCORE_SCATTER")
 
 
+def _lbt_ep_local_reduce_fused_score_bwd() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_FUSED_SCORE_BWD")
+
+
 def _lbt_get_moe_scatter_add_bf16():
     global _LBT_MOE_SCATTER_ADD_BF16, _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED
     if not _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED:
@@ -316,6 +320,61 @@ class _LBTLocalReduceScaleScatterAdd(torch.autograd.Function):
             reduced.index_add_(0, indices, scaled)
         else:
             scale_scatter_fn(routed_output, scores, indices, reduced)
+        _lbt_get_moe_indexed_scale_dot_rows_bf16()
+        ctx.save_for_backward(indices, routed_output, scores)
+        return reduced
+
+    @staticmethod
+    def backward(ctx, grad_reduced: torch.Tensor):
+        indices, routed_output, scores = ctx.saved_tensors
+        grad_reduced = grad_reduced.contiguous()
+        fused_bwd_fn = _lbt_get_moe_indexed_scale_dot_rows_bf16()
+        if (
+            fused_bwd_fn is not None
+            and grad_reduced.is_cuda
+            and routed_output.is_cuda
+            and grad_reduced.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            try:
+                grad_routed, grad_scores = fused_bwd_fn(
+                    grad_reduced,
+                    indices,
+                    routed_output,
+                    scores,
+                )
+                return grad_routed, grad_scores.reshape(-1), None, None
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                pass
+
+        grad_selected = grad_reduced.index_select(0, indices)
+        grad_routed = (grad_selected.to(torch.float32) * scores.reshape(-1, 1)).to(
+            routed_output.dtype
+        )
+        grad_scores = (
+            grad_selected.to(torch.float32) * routed_output.to(torch.float32)
+        ).sum(dim=1)
+        return grad_routed, grad_scores.reshape(-1), None, None
+
+
+class _LBTLocalReduceScaleIndexAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        scores: torch.Tensor,
+        global_token_indices: torch.Tensor,
+        output_rows: int,
+    ) -> torch.Tensor:
+        indices = global_token_indices.to(torch.int64).contiguous()
+        routed_output = routed_output.contiguous()
+        scores = scores.reshape(-1).to(torch.float32).contiguous()
+        scaled = (routed_output.to(torch.float32) * scores.reshape(-1, 1)).to(
+            routed_output.dtype
+        )
+        reduced = routed_output.new_zeros((int(output_rows), routed_output.shape[1]))
+        reduced.index_add_(0, indices, scaled)
+        _lbt_get_moe_indexed_scale_dot_rows_bf16()
         ctx.save_for_backward(indices, routed_output, scores)
         return reduced
 
@@ -358,6 +417,17 @@ def _lbt_local_reduce_index_add(
     output_rows: int,
     scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if scores is not None and _lbt_ep_local_reduce_fused_score_bwd():
+        try:
+            return _LBTLocalReduceScaleIndexAdd.apply(
+                routed_output,
+                scores,
+                global_token_indices,
+                int(output_rows),
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            pass
+
     if (
         _lbt_ep_local_reduce_tk_scatter_add()
         and routed_output.is_cuda
@@ -365,18 +435,19 @@ def _lbt_local_reduce_index_add(
         and routed_output.dtype == torch.bfloat16
     ):
         try:
-            if scores is not None:
+            if scores is not None and _lbt_ep_local_reduce_fused_score_scatter():
                 return _LBTLocalReduceScaleScatterAdd.apply(
                     routed_output,
                     scores,
                     global_token_indices,
                     int(output_rows),
                 )
-            return _LBTLocalReduceScatterAdd.apply(
-                routed_output,
-                global_token_indices,
-                int(output_rows),
-            )
+            if scores is None:
+                return _LBTLocalReduceScatterAdd.apply(
+                    routed_output,
+                    global_token_indices,
+                    int(output_rows),
+                )
         except (AttributeError, FileNotFoundError, ImportError):
             pass
 
@@ -1188,12 +1259,15 @@ class ExpertParallel(ParallelStyle):
             ).to(torch.float32)
 
         local_output = mod.forward(local_input, local_counts)
-        reduce_scores = local_scores.reshape(-1)
-        if not _lbt_ep_local_reduce_fused_score_scatter():
+        fuse_score_reduce = (
+            _lbt_ep_local_reduce_fused_score_scatter()
+            or _lbt_ep_local_reduce_fused_score_bwd()
+        )
+        reduce_scores = local_scores.reshape(-1) if fuse_score_reduce else None
+        if not fuse_score_reduce:
             local_output = (local_output.to(torch.float32) * local_scores).to(
                 local_output.dtype
             )
-            reduce_scores = None
         if (
             _lbt_ep_local_reduce_output_combine()
             and token_indices is not None
