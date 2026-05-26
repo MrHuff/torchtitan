@@ -32,6 +32,7 @@ _MXFP4_MOE_SCATTER_ADD_FN = None
 _MXFP4_MOE_INDEXED_DOT_ROWS_FN = None
 _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = None
 _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = None
+_MXFP4_MOE_INDEXED_ROWS_FN = None
 _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED = False
 _LBT_MOE_ROUTER_DEBUG_COUNT = 0
 _LBT_MOE_FORWARD_DEBUG_COUNT = 0
@@ -500,6 +501,11 @@ def _get_mxfp4_moe_indexed_scale_rows_fn():
     return _MXFP4_MOE_INDEXED_SCALE_ROWS_FN
 
 
+def _get_mxfp4_moe_indexed_rows_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_INDEXED_ROWS_FN
+
+
 def _ensure_mxfp4_moe_route_imports():
     global _MXFP4_MOE_REORDER_FN, _MXFP4_MOE_REORDER_SCORES_FULL_FN
     global _MXFP4_MOE_EP2_BALANCE_TOP3_ROUTES_FN
@@ -513,7 +519,7 @@ def _ensure_mxfp4_moe_route_imports():
     global _MXFP4_MOE_ROUTE_COMBINE_ADD_FN, _MXFP4_MOE_SCALE_SCATTER_ADD_FN
     global _MXFP4_MOE_SCATTER_ADD_FN
     global _MXFP4_MOE_INDEXED_DOT_ROWS_FN, _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN
-    global _MXFP4_MOE_INDEXED_SCALE_ROWS_FN
+    global _MXFP4_MOE_INDEXED_SCALE_ROWS_FN, _MXFP4_MOE_INDEXED_ROWS_FN
     global _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED
     if _MXFP4_MOE_REORDER_IMPORT_ATTEMPTED:
         return
@@ -538,6 +544,7 @@ def _ensure_mxfp4_moe_route_imports():
         _MXFP4_MOE_INDEXED_DOT_ROWS_FN = None
         _MXFP4_MOE_INDEXED_SCALE_DOT_ROWS_FN = None
         _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = None
+        _MXFP4_MOE_INDEXED_ROWS_FN = None
     else:
         _MXFP4_MOE_REORDER_FN = getattr(mxfp4_backend, "mxfp4_moe_reorder_indices", None)
         _MXFP4_MOE_REORDER_SCORES_FULL_FN = getattr(
@@ -583,6 +590,9 @@ def _ensure_mxfp4_moe_route_imports():
         )
         _MXFP4_MOE_INDEXED_SCALE_ROWS_FN = getattr(
             mxfp4_backend, "mxfp4_moe_indexed_scale_rows_bf16", None
+        )
+        _MXFP4_MOE_INDEXED_ROWS_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_indexed_rows_bf16", None
         )
 
 
@@ -645,6 +655,10 @@ def _mxfp4_deepseek_tk_scored_fallback_combine_bwd() -> bool:
 
 def _mxfp4_deepseek_tk_index_fallback_combine_fwd() -> bool:
     return _lbt_env_flag("MXFP4_DEEPSEEK_TK_INDEX_FALLBACK_COMBINE_FWD", False)
+
+
+def _mxfp4_deepseek_tk_index_fallback_combine_bwd() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_INDEX_FALLBACK_COMBINE_BWD", True)
 
 
 def _mxfp4_deepseek_tk_scored_route_inverse_combine() -> bool:
@@ -1078,7 +1092,24 @@ class _MoEIndexCombineFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (token_indices,) = ctx.saved_tensors
         grad_base = grad_output
-        grad_routed_output = grad_output.index_select(0, token_indices)
+        grad_routed_output = None
+        if (
+            _mxfp4_deepseek_tk_index_fallback_combine_bwd()
+            and grad_output.is_cuda
+            and token_indices.is_cuda
+            and grad_output.dtype == torch.bfloat16
+        ):
+            indexed_rows_fn = _get_mxfp4_moe_indexed_rows_fn()
+            try:
+                if indexed_rows_fn is not None:
+                    grad_routed_output = indexed_rows_fn(
+                        _mxfp4_as_contiguous_dtype(grad_output, torch.bfloat16),
+                        token_indices,
+                    )
+            except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                grad_routed_output = None
+        if grad_routed_output is None:
+            grad_routed_output = grad_output.index_select(0, token_indices)
         return grad_base, None, grad_routed_output
 
 
