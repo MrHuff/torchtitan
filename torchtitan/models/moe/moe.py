@@ -681,6 +681,10 @@ def _mxfp4_deepseek_tk_ep2_cover_top6() -> bool:
     return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_COVER_TOP6", False)
 
 
+def _mxfp4_deepseek_tk_ep2_balance_top6_fallback() -> bool:
+    return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_BALANCE_TOP6_FALLBACK", False)
+
+
 def _mxfp4_deepseek_tk_indexed_scale_bwd() -> bool:
     return _lbt_env_flag("MXFP4_DEEPSEEK_TK_INDEXED_SCALE_BWD", True)
 
@@ -1686,6 +1690,86 @@ class TokenChoiceTopKRouter(nn.Module):
 
         return selected_experts_indices
 
+    def _apply_balanced_top6_ep_route_coverage(
+        self,
+        route_scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+        selected_group1: torch.Tensor,
+        experts_per_group: int,
+    ) -> torch.Tensor:
+        if (
+            not _mxfp4_deepseek_tk_ep2_balance_top6_fallback()
+            or self.top_k != 6
+            or not selected_experts_indices.is_cuda
+            or selected_experts_indices.dtype != torch.int64
+            or route_scores.dim() != 2
+            or route_scores.shape[1] != self.num_experts
+        ):
+            return selected_experts_indices
+
+        target_group1 = self.top_k // 2
+        current_group1 = selected_group1.to(torch.int64).sum(dim=1)
+        need_group1 = torch.clamp_min(target_group1 - current_group1, 0)
+        need_group0 = torch.clamp_min(current_group1 - target_group1, 0)
+        if not bool((need_group1 | need_group0).any().item()):
+            return selected_experts_indices
+
+        group0_scores = route_scores[:, :experts_per_group].clone()
+        group1_scores = route_scores[:, experts_per_group:].clone()
+
+        selected_group0 = selected_experts_indices.masked_fill(selected_group1, 0)
+        selected_group1_local = selected_experts_indices.masked_fill(
+            ~selected_group1,
+            experts_per_group,
+        ) - experts_per_group
+        group0_selected_mask = (
+            F.one_hot(selected_group0, num_classes=experts_per_group).bool()
+            & (~selected_group1).unsqueeze(-1)
+        ).any(dim=1)
+        group1_selected_mask = (
+            F.one_hot(selected_group1_local, num_classes=experts_per_group).bool()
+            & selected_group1.unsqueeze(-1)
+        ).any(dim=1)
+        group0_scores = group0_scores.masked_fill(group0_selected_mask, float("-inf"))
+        group1_scores = group1_scores.masked_fill(group1_selected_mask, float("-inf"))
+
+        replacement_group0 = torch.topk(group0_scores, k=target_group1, dim=1).indices
+        replacement_group1 = (
+            torch.topk(group1_scores, k=target_group1, dim=1).indices
+            + experts_per_group
+        )
+
+        selected_experts_indices = selected_experts_indices.clone()
+        added_group1 = torch.zeros_like(need_group1)
+        added_group0 = torch.zeros_like(need_group0)
+
+        for pos in range(self.top_k - 1, -1, -1):
+            replace_group1 = (~selected_group1[:, pos]) & (added_group1 < need_group1)
+            repl_group1 = replacement_group1.gather(
+                1,
+                added_group1.clamp_max(target_group1 - 1).reshape(-1, 1),
+            ).reshape(-1)
+            selected_experts_indices[:, pos] = torch.where(
+                replace_group1,
+                repl_group1,
+                selected_experts_indices[:, pos],
+            )
+            added_group1 = added_group1 + replace_group1.to(added_group1.dtype)
+
+            replace_group0 = selected_group1[:, pos] & (added_group0 < need_group0)
+            repl_group0 = replacement_group0.gather(
+                1,
+                added_group0.clamp_max(target_group1 - 1).reshape(-1, 1),
+            ).reshape(-1)
+            selected_experts_indices[:, pos] = torch.where(
+                replace_group0,
+                repl_group0,
+                selected_experts_indices[:, pos],
+            )
+            added_group0 = added_group0 + replace_group0.to(added_group0.dtype)
+
+        return selected_experts_indices
+
     def _apply_ep_route_coverage(
         self,
         route_scores: torch.Tensor,
@@ -1697,6 +1781,17 @@ class TokenChoiceTopKRouter(nn.Module):
 
         experts_per_group = self.num_experts // ep_degree
         selected_group1 = selected_experts_indices >= experts_per_group
+
+        if (
+            self._ep_route_coverage_mode() in ("balanced_fast", "fast_balanced")
+            and self.top_k == 6
+        ):
+            return self._apply_balanced_top6_ep_route_coverage(
+                route_scores,
+                selected_experts_indices,
+                selected_group1,
+                experts_per_group,
+            )
 
         if (
             self._ep_route_coverage_mode() in ("balanced_fast", "fast_balanced")
