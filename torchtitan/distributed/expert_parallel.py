@@ -438,7 +438,7 @@ class _LBTLocalReduceRouteOrderScaleScatterAdd(torch.autograd.Function):
     ) -> torch.Tensor:
         routed_output = routed_output.contiguous()
         scores = scores.reshape(-1).to(torch.float32).contiguous()
-        token_indices = local_token_indices.reshape(-1).to(torch.int64).contiguous()
+        token_indices = local_token_indices.reshape(-1).to(torch.int32).contiguous()
         permuted_indices = permuted_indices.reshape(-1).contiguous()
         fused_fn = _lbt_get_moe_scale_scatter_add_permuted_ep2_bf16()
         if fused_fn is None:
