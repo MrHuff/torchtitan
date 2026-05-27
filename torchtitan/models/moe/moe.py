@@ -22,6 +22,7 @@ _MXFP4_MOE_EP2_SELECT_TOP3_BALANCE_SCORES_FN = None
 _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN = None
 _MXFP4_MOE_EP2_SELECT_TOP6_COVER_SCORES_FN = None
 _MXFP4_MOE_EP2_SELECT_TOP6_BALANCE_SCORES_FN = None
+_MXFP4_MOE_EP2_SELECT_TOP6_STRIPED_SCORES_FN = None
 _MXFP4_MOE_EP2_COVER_TOP6_SCORES_FN = None
 _MXFP4_MOE_EP2_SCATTER_TOP6_SCORES_FN = None
 _MXFP4_MOE_GATHER_SCORES_FN = None
@@ -452,6 +453,11 @@ def _get_mxfp4_moe_ep2_select_top6_balance_scores_fn():
     return _MXFP4_MOE_EP2_SELECT_TOP6_BALANCE_SCORES_FN
 
 
+def _get_mxfp4_moe_ep2_select_top6_striped_scores_fn():
+    _ensure_mxfp4_moe_route_imports()
+    return _MXFP4_MOE_EP2_SELECT_TOP6_STRIPED_SCORES_FN
+
+
 def _get_mxfp4_moe_ep2_cover_top6_scores_fn():
     _ensure_mxfp4_moe_route_imports()
     return _MXFP4_MOE_EP2_COVER_TOP6_SCORES_FN
@@ -519,6 +525,7 @@ def _ensure_mxfp4_moe_route_imports():
     global _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN
     global _MXFP4_MOE_EP2_SELECT_TOP6_COVER_SCORES_FN
     global _MXFP4_MOE_EP2_SELECT_TOP6_BALANCE_SCORES_FN
+    global _MXFP4_MOE_EP2_SELECT_TOP6_STRIPED_SCORES_FN
     global _MXFP4_MOE_EP2_COVER_TOP6_SCORES_FN
     global _MXFP4_MOE_EP2_SCATTER_TOP6_SCORES_FN
     global _MXFP4_MOE_GATHER_SCORES_FN, _MXFP4_MOE_SCATTER_SCORES_FN
@@ -541,6 +548,7 @@ def _ensure_mxfp4_moe_route_imports():
         _MXFP4_MOE_EP2_SCATTER_TOP3_SCORES_FN = None
         _MXFP4_MOE_EP2_SELECT_TOP6_COVER_SCORES_FN = None
         _MXFP4_MOE_EP2_SELECT_TOP6_BALANCE_SCORES_FN = None
+        _MXFP4_MOE_EP2_SELECT_TOP6_STRIPED_SCORES_FN = None
         _MXFP4_MOE_EP2_COVER_TOP6_SCORES_FN = None
         _MXFP4_MOE_EP2_SCATTER_TOP6_SCORES_FN = None
         _MXFP4_MOE_GATHER_SCORES_FN = None
@@ -572,6 +580,9 @@ def _ensure_mxfp4_moe_route_imports():
         )
         _MXFP4_MOE_EP2_SELECT_TOP6_BALANCE_SCORES_FN = getattr(
             mxfp4_backend, "mxfp4_moe_ep2_select_top6_balance_scores", None
+        )
+        _MXFP4_MOE_EP2_SELECT_TOP6_STRIPED_SCORES_FN = getattr(
+            mxfp4_backend, "mxfp4_moe_ep2_select_top6_striped_scores", None
         )
         _MXFP4_MOE_EP2_COVER_TOP6_SCORES_FN = getattr(
             mxfp4_backend, "mxfp4_moe_ep2_cover_top6_scores", None
@@ -690,6 +701,15 @@ def _mxfp4_deepseek_tk_ep2_select_top6() -> bool:
 
 def _mxfp4_deepseek_tk_ep2_select_top6_balance() -> bool:
     return _lbt_env_flag("MXFP4_DEEPSEEK_TK_EP2_SELECT_TOP6_BALANCE", False)
+
+
+def _mxfp4_deepseek_tk_ep2_select_top6_striped_count() -> int:
+    raw = os.environ.get("MXFP4_DEEPSEEK_TK_EP2_SELECT_TOP6_STRIPED_COUNT", "0")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return min(max(value, 0), 3)
 
 
 def _mxfp4_deepseek_tk_ep2_cover_top6() -> bool:
@@ -1055,6 +1075,66 @@ class _MXFP4MoEEP2SelectTop6BalanceFunction(torch.autograd.Function):
                 )
             grad_scores = grad_scores.to(ctx.score_dtype)
         return grad_scores, None, None
+
+
+class _MXFP4MoEEP2SelectTop6StripedFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        scores: torch.Tensor,
+        expert_bias: torch.Tensor | None,
+        experts_per_group: int,
+        stripe_count: int,
+    ):
+        fn = _get_mxfp4_moe_ep2_select_top6_striped_scores_fn()
+        if fn is None:
+            raise AttributeError("mxfp4_moe_ep2_select_top6_striped_scores unavailable")
+        scores_f32 = _mxfp4_as_contiguous_dtype(scores, torch.float32)
+        if expert_bias is None:
+            bias = scores_f32.new_empty((0,))
+        else:
+            bias = _mxfp4_as_contiguous_dtype(expert_bias, torch.float32)
+        top_scores, selected_experts_indices = fn(
+            scores_f32,
+            bias,
+            int(experts_per_group),
+            int(stripe_count),
+        )
+        ctx.orig_shape = tuple(scores.shape)
+        ctx.score_dtype = scores.dtype
+        ctx.save_for_backward(selected_experts_indices)
+        ctx.mark_non_differentiable(selected_experts_indices)
+        return top_scores.to(scores.dtype), selected_experts_indices
+
+    @staticmethod
+    def backward(ctx, grad_top_scores: torch.Tensor, _grad_selected=None):
+        (selected_experts_indices,) = ctx.saved_tensors
+        grad_scores = None
+        if ctx.needs_input_grad[0]:
+            grad_top_scores = _mxfp4_as_contiguous_dtype(grad_top_scores, torch.float32)
+            scatter_fn = _get_mxfp4_moe_ep2_scatter_top6_scores_fn()
+            if scatter_fn is not None:
+                try:
+                    grad_scores = scatter_fn(
+                        grad_top_scores,
+                        selected_experts_indices,
+                        int(ctx.orig_shape[1]),
+                    )
+                except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+                    grad_scores = None
+            if grad_scores is None:
+                grad_scores = torch.zeros(
+                    ctx.orig_shape,
+                    device=grad_top_scores.device,
+                    dtype=torch.float32,
+                )
+                grad_scores.scatter_add_(
+                    1,
+                    selected_experts_indices,
+                    grad_top_scores,
+                )
+            grad_scores = grad_scores.to(ctx.score_dtype)
+        return grad_scores, None, None, None
 
 
 class _MXFP4MoEEP2CoverTop6Function(torch.autograd.Function):
@@ -2012,6 +2092,46 @@ class TokenChoiceTopKRouter(nn.Module):
         except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
             return None
 
+    def _try_mxfp4_ep2_select_top6_striped(
+        self,
+        scores: torch.Tensor,
+        expert_bias: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        stripe_count = _mxfp4_deepseek_tk_ep2_select_top6_striped_count()
+        if (
+            stripe_count <= 0
+            or self.top_k != 6
+            or self._ep_route_coverage_degree() != 2
+            or self._ep_route_coverage_mode()
+            not in ("best", "balanced_fast", "fast_balanced")
+            or not scores.is_cuda
+            or scores.dtype != torch.float32
+            or scores.dim() != 2
+            or self.num_experts % 2 != 0
+            or self.num_experts // 2 < 3
+        ):
+            return None
+        bias = _lbt_local_tensor(expert_bias) if expert_bias is not None else None
+        if (
+            bias is not None
+            and (
+                not bias.is_cuda
+                or bias.device != scores.device
+                or bias.dim() != 1
+                or bias.numel() != self.num_experts
+            )
+        ):
+            return None
+        try:
+            return _MXFP4MoEEP2SelectTop6StripedFunction.apply(
+                scores,
+                bias,
+                self.num_experts // 2,
+                stripe_count,
+            )
+        except (AttributeError, FileNotFoundError, ImportError, RuntimeError):
+            return None
+
     def _try_mxfp4_ep2_cover_top6(
         self,
         scores: torch.Tensor,
@@ -2095,6 +2215,8 @@ class TokenChoiceTopKRouter(nn.Module):
         elif expert_bias is not None:
             fused_route = self._try_mxfp4_ep2_select_top3_balance(scores, expert_bias)
             if fused_route is None:
+                fused_route = self._try_mxfp4_ep2_select_top6_striped(scores, expert_bias)
+            if fused_route is None:
                 fused_route = self._try_mxfp4_ep2_select_top6_balance(scores, expert_bias)
             if fused_route is None:
                 fused_route = self._try_mxfp4_ep2_select_top6_cover(scores, expert_bias)
@@ -2128,6 +2250,8 @@ class TokenChoiceTopKRouter(nn.Module):
                 top_scores = scores.gather(dim=1, index=selected_experts_indices)
             else:
                 fused_route = self._try_mxfp4_ep2_select_top3_balance(scores, None)
+                if fused_route is None:
+                    fused_route = self._try_mxfp4_ep2_select_top6_striped(scores, None)
                 if fused_route is None:
                     fused_route = self._try_mxfp4_ep2_select_top6_balance(scores, None)
                 if fused_route is None:
