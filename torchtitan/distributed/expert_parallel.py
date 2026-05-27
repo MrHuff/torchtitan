@@ -38,6 +38,10 @@ _LBT_MOE_SCALE_ROWS_BF16 = None
 _LBT_MOE_SCALE_ROWS_BF16_IMPORT_ATTEMPTED = False
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16 = None
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16_IMPORT_ATTEMPTED = False
+_LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16 = None
+_LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = False
+_LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16 = None
+_LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = False
 
 
 def _lbt_env_flag(name: str, default: bool = False) -> bool:
@@ -230,6 +234,10 @@ def _lbt_ep_local_reduce_fused_scale_rows() -> bool:
     return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_FUSED_SCALE_ROWS")
 
 
+def _lbt_ep_local_reduce_route_fused() -> bool:
+    return _lbt_env_flag("LBT_EP_LOCAL_REDUCE_ROUTE_FUSED")
+
+
 def _lbt_get_moe_scatter_add_bf16():
     global _LBT_MOE_SCATTER_ADD_BF16, _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED
     if not _LBT_MOE_SCATTER_ADD_BF16_IMPORT_ATTEMPTED:
@@ -293,6 +301,42 @@ def _lbt_get_moe_indexed_scale_dot_rows_bf16():
                 mxfp4_moe_indexed_scale_dot_rows_bf16
             )
     return _LBT_MOE_INDEXED_SCALE_DOT_ROWS_BF16
+
+
+def _lbt_get_moe_scale_scatter_add_permuted_ep2_bf16():
+    global _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16
+    global _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED
+    if not _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED:
+        _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_scale_scatter_add_permuted_ep2_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16 = None
+        else:
+            _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16 = (
+                mxfp4_moe_scale_scatter_add_permuted_ep2_bf16
+            )
+    return _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16
+
+
+def _lbt_get_moe_indexed_scale_dot_rows_permuted_ep2_bf16():
+    global _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16
+    global _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED
+    if not _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED:
+        _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_indexed_scale_dot_rows_permuted_ep2_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16 = None
+        else:
+            _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16 = (
+                mxfp4_moe_indexed_scale_dot_rows_permuted_ep2_bf16
+            )
+    return _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16
 
 
 class _LBTLocalReduceScatterAdd(torch.autograd.Function):
@@ -377,6 +421,76 @@ class _LBTLocalReduceScaleScatterAdd(torch.autograd.Function):
             grad_selected.to(torch.float32) * routed_output.to(torch.float32)
         ).sum(dim=1)
         return grad_routed, grad_scores.reshape(-1), None, None
+
+
+class _LBTLocalReduceRouteOrderScaleScatterAdd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        scores: torch.Tensor,
+        local_token_indices: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        output_rows: int,
+        split0: int,
+        route_rows: int,
+        num_origin_tokens: int,
+    ) -> torch.Tensor:
+        routed_output = routed_output.contiguous()
+        scores = scores.reshape(-1).to(torch.float32).contiguous()
+        token_indices = local_token_indices.reshape(-1).to(torch.int64).contiguous()
+        permuted_indices = permuted_indices.reshape(-1).contiguous()
+        fused_fn = _lbt_get_moe_scale_scatter_add_permuted_ep2_bf16()
+        if fused_fn is None:
+            raise RuntimeError("mxfp4_moe_scale_scatter_add_permuted_ep2_bf16 unavailable")
+        reduced, route_to_permuted = fused_fn(
+            routed_output,
+            scores,
+            token_indices,
+            permuted_indices,
+            int(output_rows),
+            int(split0),
+            int(route_rows),
+            int(num_origin_tokens),
+        )
+        _lbt_get_moe_indexed_scale_dot_rows_permuted_ep2_bf16()
+        ctx.split0 = int(split0)
+        ctx.num_origin_tokens = int(num_origin_tokens)
+        ctx.save_for_backward(token_indices, route_to_permuted, routed_output, scores)
+        return reduced
+
+    @staticmethod
+    def backward(ctx, grad_reduced: torch.Tensor):
+        token_indices, route_to_permuted, routed_output, scores = ctx.saved_tensors
+        grad_reduced = grad_reduced.contiguous()
+        fused_bwd_fn = _lbt_get_moe_indexed_scale_dot_rows_permuted_ep2_bf16()
+        if (
+            fused_bwd_fn is not None
+            and grad_reduced.is_cuda
+            and routed_output.is_cuda
+            and grad_reduced.dtype == torch.bfloat16
+            and routed_output.dtype == torch.bfloat16
+        ):
+            grad_routed, grad_scores = fused_bwd_fn(
+                grad_reduced,
+                token_indices,
+                route_to_permuted,
+                routed_output,
+                scores,
+                ctx.split0,
+                ctx.num_origin_tokens,
+            )
+            return (
+                grad_routed,
+                grad_scores.reshape(-1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        raise RuntimeError("mxfp4_moe_indexed_scale_dot_rows_permuted_ep2_bf16 unavailable")
 
 
 class _LBTLocalReduceScaleIndexAdd(torch.autograd.Function):
@@ -1098,6 +1212,56 @@ class ExpertParallel(ParallelStyle):
     ) -> torch.Tensor:
         ep_degree = int(device_mesh.shape[0])
         num_origin_tokens = int(num_origin_tokens)
+        if (
+            _lbt_ep_local_reduce_route_fused()
+            and local_scores is not None
+            and ep_degree == 2
+            and not _lbt_ep_local_reduce_a2a_bwd()
+            and routed_output.is_cuda
+            and routed_output.dtype == torch.bfloat16
+            and local_token_indices.is_cuda
+            and self.permuted_indices is not None
+            and self.permuted_indices.is_cuda
+            and self.permuted_indices.dtype == torch.int32
+            and len(self.output_splits) == 2
+            and int(local_token_indices.numel()) == int(routed_output.shape[0])
+            and int(local_scores.numel()) == int(routed_output.shape[0])
+            and int(self.permuted_indices.numel()) == int(routed_output.shape[0])
+        ):
+            route_rows = int(sum(self.output_splits))
+            reduced = _LBTLocalReduceRouteOrderScaleScatterAdd.apply(
+                routed_output,
+                local_scores,
+                local_token_indices,
+                self.permuted_indices,
+                ep_degree * num_origin_tokens,
+                int(self.output_splits[0]),
+                route_rows,
+                num_origin_tokens,
+            )
+            token_splits = [num_origin_tokens for _ in range(ep_degree)]
+            _lbt_debug_ep_splits(
+                "combine_reduced_route_fused",
+                reduced,
+                token_splits,
+                token_splits,
+                device_mesh,
+            )
+            if _lbt_ep_local_reduce_collective() == "reduce_scatter":
+                return reduce_scatter_tensor_autograd(
+                    reduced.contiguous(),
+                    "sum",
+                    0,
+                    device_mesh.get_group(),
+                )
+            partials = _lbt_all_to_all_single_autograd(
+                reduced,
+                token_splits,
+                token_splits,
+                device_mesh.get_group(),
+            )
+            return partials.view(ep_degree, num_origin_tokens, -1).sum(dim=0)
+
         if (
             _lbt_ep_local_reduce_permuted()
             and not _lbt_ep_local_reduce_a2a_bwd()
