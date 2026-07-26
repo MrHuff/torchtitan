@@ -2989,62 +2989,39 @@ class MoE(nn.Module):
                 return fused_out.reshape(bs, slen, dim)
 
         use_indexed_fallback_combine = _mxfp4_deepseek_indexed_fallback_combine()
+        routed_output_is_scored = False
+        routed_output_is_precombined = False
+        routed_output = None
         if use_indexed_fallback_combine:
             # shape (bs*slen*top_k)
             token_indices_experts_sorted = token_indices_experts_sorted.reshape(-1)
-
-            # shape (bs*slen*top_k, dim)
-            routed_input = x.index_select(dim=0, index=token_indices_experts_sorted)
         else:
             # shape (bs*slen*top_k, dim)
             token_indices_experts_sorted = token_indices_experts_sorted.reshape(
                 -1, 1
             ).expand(-1, dim)
 
-            # shape (bs*slen*top_k, dim)
-            routed_input = torch.gather(
-                x,
-                dim=0,
-                index=token_indices_experts_sorted,
+        ep_indexed_scored_output_combine = (
+            getattr(
+                self.experts,
+                "forward_ep_indexed_scored_output_combine",
+                None,
             )
-
-        if self.score_before_experts:
-            routed_input = (
-                routed_input.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
-
-        if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
-            with torch.no_grad():
-                print(
-                    "[lbt_moe_route_metadata]"
-                    f" rank={_lbt_dist_rank()}"
-                    " pre_experts=1"
-                    f" routed_rows={int(routed_input.shape[0])}"
-                    f" count_dtype={num_tokens_per_expert.dtype}"
-                    f" count_sum={int(num_tokens_per_expert.to(torch.int64).sum().item())}"
-                    f" counts={num_tokens_per_expert.to(torch.int64).tolist()}",
-                    flush=True,
-                )
-
-        routed_output_is_scored = False
-        routed_output_is_precombined = False
-        routed_output = None
-        ep_scored_output_combine = (
-            getattr(self.experts, "forward_ep_scored_output_combine", None)
             if use_indexed_fallback_combine and not self.score_before_experts
             else None
         )
-        if ep_scored_output_combine is not None:
-            if top_scores_experts_sorted is None:
-                if route_positions_experts_sorted is not None:
-                    top_scores_experts_sorted = _mxfp4_gather_route_scores(
-                        top_scores,
-                        route_positions_experts_sorted,
-                    )
+        if ep_indexed_scored_output_combine is not None:
+            if (
+                top_scores_experts_sorted is None
+                and route_positions_experts_sorted is not None
+            ):
+                top_scores_experts_sorted = _mxfp4_gather_route_scores(
+                    top_scores,
+                    route_positions_experts_sorted,
+                )
             if top_scores_experts_sorted is not None:
-                routed_output = ep_scored_output_combine(
-                    routed_input,
+                routed_output = ep_indexed_scored_output_combine(
+                    x,
                     num_tokens_per_expert,
                     top_scores_experts_sorted.reshape(-1),
                     token_indices_experts_sorted,
@@ -3056,9 +3033,75 @@ class MoE(nn.Module):
                     and routed_output.dim() == 2
                     and int(routed_output.shape[0]) == int(x.shape[0])
                 )
+
         if routed_output is None:
-            # shape (bs*slen*top_k, dim)
-            routed_output = self.experts(routed_input, num_tokens_per_expert)
+            if use_indexed_fallback_combine:
+                # shape (bs*slen*top_k, dim)
+                routed_input = x.index_select(
+                    dim=0,
+                    index=token_indices_experts_sorted,
+                )
+            else:
+                # shape (bs*slen*top_k, dim)
+                routed_input = torch.gather(
+                    x,
+                    dim=0,
+                    index=token_indices_experts_sorted,
+                )
+
+            if self.score_before_experts:
+                routed_input = (
+                    routed_input.to(torch.float32)
+                    * top_scores_experts_sorted.reshape(-1, 1)
+                ).to(x.dtype)
+
+            if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
+                with torch.no_grad():
+                    print(
+                        "[lbt_moe_route_metadata]"
+                        f" rank={_lbt_dist_rank()}"
+                        " pre_experts=1"
+                        f" routed_rows={int(routed_input.shape[0])}"
+                        f" count_dtype={num_tokens_per_expert.dtype}"
+                        f" count_sum={int(num_tokens_per_expert.to(torch.int64).sum().item())}"
+                        f" counts={num_tokens_per_expert.to(torch.int64).tolist()}",
+                        flush=True,
+                    )
+
+            ep_scored_output_combine = (
+                getattr(self.experts, "forward_ep_scored_output_combine", None)
+                if use_indexed_fallback_combine and not self.score_before_experts
+                else None
+            )
+            if ep_scored_output_combine is not None:
+                if (
+                    top_scores_experts_sorted is None
+                    and route_positions_experts_sorted is not None
+                ):
+                    top_scores_experts_sorted = _mxfp4_gather_route_scores(
+                        top_scores,
+                        route_positions_experts_sorted,
+                    )
+                if top_scores_experts_sorted is not None:
+                    routed_output = ep_scored_output_combine(
+                        routed_input,
+                        num_tokens_per_expert,
+                        top_scores_experts_sorted.reshape(-1),
+                        token_indices_experts_sorted,
+                        int(x.shape[0]),
+                    )
+                    routed_output_is_scored = routed_output is not None
+                    routed_output_is_precombined = (
+                        routed_output_is_scored
+                        and routed_output.dim() == 2
+                        and int(routed_output.shape[0]) == int(x.shape[0])
+                    )
+            if routed_output is None:
+                # shape (bs*slen*top_k, dim)
+                routed_output = self.experts(
+                    routed_input,
+                    num_tokens_per_expert,
+                )
 
         # shared expert
         # Note: we execute the shared expert before scoring the output of the routed expert

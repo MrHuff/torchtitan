@@ -42,6 +42,12 @@ _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16 = None
 _LBT_MOE_SCALE_SCATTER_ADD_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = False
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16 = None
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = False
+_LBT_MOE_PACK_INDEXED_DISPATCH_BF16 = None
+_LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16 = None
+_LBT_MOE_INDEXED_DISPATCH_PACK_IMPORT_ATTEMPTED = False
+_LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16 = None
+_LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16 = None
+_LBT_MOE_PERMUTED_DISPATCH_UNPACK_IMPORT_ATTEMPTED = False
 
 
 def _lbt_env_flag(name: str, default: bool = False) -> bool:
@@ -206,6 +212,16 @@ def _lbt_ep_score_dispatch_mode() -> str:
     return "separate_fp32"
 
 
+def _lbt_ep_fused_indexed_dispatch_pack() -> bool:
+    return _lbt_env_flag("LBT_EP_FUSED_INDEXED_DISPATCH_PACK")
+
+
+def _lbt_ep_fused_indexed_dispatch_unpack() -> bool:
+    if "LBT_EP_FUSED_INDEXED_DISPATCH_UNPACK" in os.environ:
+        return _lbt_env_flag("LBT_EP_FUSED_INDEXED_DISPATCH_UNPACK")
+    return _lbt_ep_fused_indexed_dispatch_pack()
+
+
 def _lbt_ep_local_reduce_index_dtype() -> str:
     value = os.environ.get("LBT_EP_LOCAL_REDUCE_INDEX_DTYPE", "int64")
     value = value.strip().lower()
@@ -337,6 +353,177 @@ def _lbt_get_moe_indexed_scale_dot_rows_permuted_ep2_bf16():
                 mxfp4_moe_indexed_scale_dot_rows_permuted_ep2_bf16
             )
     return _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16
+
+
+def _lbt_get_moe_indexed_dispatch_pack():
+    global _LBT_MOE_PACK_INDEXED_DISPATCH_BF16
+    global _LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16
+    global _LBT_MOE_INDEXED_DISPATCH_PACK_IMPORT_ATTEMPTED
+    if not _LBT_MOE_INDEXED_DISPATCH_PACK_IMPORT_ATTEMPTED:
+        _LBT_MOE_INDEXED_DISPATCH_PACK_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_indexed_dispatch_available,
+                mxfp4_moe_pack_indexed_dispatch_bf16,
+                mxfp4_moe_unpack_indexed_dispatch_grad_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_PACK_INDEXED_DISPATCH_BF16 = None
+            _LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16 = None
+        else:
+            if mxfp4_moe_indexed_dispatch_available():
+                _LBT_MOE_PACK_INDEXED_DISPATCH_BF16 = (
+                    mxfp4_moe_pack_indexed_dispatch_bf16
+                )
+                _LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16 = (
+                    mxfp4_moe_unpack_indexed_dispatch_grad_bf16
+                )
+    if (
+        _LBT_MOE_PACK_INDEXED_DISPATCH_BF16 is None
+        or _LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16 is None
+    ):
+        return None
+    return (
+        _LBT_MOE_PACK_INDEXED_DISPATCH_BF16,
+        _LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16,
+    )
+
+
+def _lbt_get_moe_permuted_dispatch_unpack():
+    global _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16
+    global _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16
+    global _LBT_MOE_PERMUTED_DISPATCH_UNPACK_IMPORT_ATTEMPTED
+    if not _LBT_MOE_PERMUTED_DISPATCH_UNPACK_IMPORT_ATTEMPTED:
+        _LBT_MOE_PERMUTED_DISPATCH_UNPACK_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_indexed_dispatch_available,
+                mxfp4_moe_pack_permuted_dispatch_grad_bf16,
+                mxfp4_moe_unpack_permuted_dispatch_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16 = None
+            _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16 = None
+        else:
+            if mxfp4_moe_indexed_dispatch_available():
+                _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16 = (
+                    mxfp4_moe_unpack_permuted_dispatch_bf16
+                )
+                _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16 = (
+                    mxfp4_moe_pack_permuted_dispatch_grad_bf16
+                )
+    if (
+        _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16 is None
+        or _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16 is None
+    ):
+        return None
+    return (
+        _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16,
+        _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16,
+    )
+
+
+class _LBTIndexedDispatchPack(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        source_input: torch.Tensor,
+        token_indices: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        pack_ops = _lbt_get_moe_indexed_dispatch_pack()
+        if pack_ops is None:
+            raise RuntimeError("MXFP4 indexed dispatch pack helpers are unavailable")
+        pack_fn, _ = pack_ops
+        token_indices = token_indices.to(torch.int64).contiguous()
+        scores = scores.to(torch.float32).contiguous()
+        packed = pack_fn(source_input.contiguous(), token_indices, scores)
+        ctx.save_for_backward(token_indices)
+        ctx.input_rows = int(source_input.shape[0])
+        ctx.input_cols = int(source_input.shape[1])
+        return packed
+
+    @staticmethod
+    def backward(ctx, grad_packed: torch.Tensor):
+        (token_indices,) = ctx.saved_tensors
+        pack_ops = _lbt_get_moe_indexed_dispatch_pack()
+        if pack_ops is None:
+            raise RuntimeError("MXFP4 indexed dispatch pack helpers are unavailable")
+        _, unpack_grad_fn = pack_ops
+        grad_input, grad_scores = unpack_grad_fn(
+            grad_packed.contiguous(),
+            token_indices,
+            ctx.input_rows,
+            ctx.input_cols,
+        )
+        return grad_input, None, grad_scores
+
+
+class _LBTPermutedDispatchUnpack(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        packed: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        input_cols: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        unpack_ops = _lbt_get_moe_permuted_dispatch_unpack()
+        if unpack_ops is None:
+            raise RuntimeError("MXFP4 permuted dispatch unpack helpers are unavailable")
+        unpack_fn, _ = unpack_ops
+        permuted_indices = permuted_indices.to(torch.int32).contiguous()
+        local_input, local_scores, local_token_indices = unpack_fn(
+            packed.contiguous(),
+            permuted_indices,
+            int(input_cols),
+        )
+        ctx.save_for_backward(permuted_indices)
+        ctx.input_rows = int(packed.shape[0])
+        ctx.input_cols = int(input_cols)
+        ctx.mark_non_differentiable(local_token_indices)
+        return local_input, local_scores, local_token_indices
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_local_input: torch.Tensor | None,
+        grad_local_scores: torch.Tensor | None,
+        _grad_local_token_indices: torch.Tensor | None,
+    ):
+        (permuted_indices,) = ctx.saved_tensors
+        if grad_local_input is None:
+            grad_local_input = torch.zeros(
+                (int(permuted_indices.numel()), ctx.input_cols),
+                device=permuted_indices.device,
+                dtype=torch.bfloat16,
+            )
+        if grad_local_scores is None:
+            grad_local_scores = torch.zeros(
+                int(permuted_indices.numel()),
+                device=permuted_indices.device,
+                dtype=torch.float32,
+            )
+        unpack_ops = _lbt_get_moe_permuted_dispatch_unpack()
+        if unpack_ops is None:
+            raise RuntimeError("MXFP4 permuted dispatch unpack helpers are unavailable")
+        _, pack_grad_fn = unpack_ops
+        grad_packed = pack_grad_fn(
+            grad_local_input.contiguous(),
+            grad_local_scores.reshape(-1).to(torch.float32).contiguous(),
+            permuted_indices,
+            ctx.input_rows,
+        )
+        return grad_packed, None, None
+
+
+class _LBTCollectiveWait(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        return torch.ops._c10d_functional.wait_tensor(tensor)
+
+    @staticmethod
+    def backward(ctx, grad_tensor: torch.Tensor):
+        return grad_tensor
 
 
 class _LBTLocalReduceScatterAdd(torch.autograd.Function):
@@ -988,6 +1175,15 @@ class ExpertParallel(ParallelStyle):
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, mod, inputs, device_mesh):
+        return self._token_dispatch_impl(mod, inputs, device_mesh)
+
+    def _token_dispatch_impl(
+        self,
+        mod,
+        inputs,
+        device_mesh,
+        fused_packed_input_cols: int | None = None,
+    ):
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
         if _lbt_env_flag("LBT_MOE_ROUTE_METADATA_DEBUG"):
@@ -1121,23 +1317,68 @@ class ExpertParallel(ParallelStyle):
         # Note that this will create side effects when wrapping the for-loop implementation
         # of GroupedExperts, as it does not need padding.
 
-        (
-            self.input_shape,
-            routed_input,
-            self.permuted_indices,
-            num_tokens_per_expert_group,
-        ) = _permute(
-            routed_input,
-            num_tokens_per_expert_group,
-            ep_degree,
-            num_local_experts,
-            local_expert_counts_i32,
-        )
+        if fused_packed_input_cols is None:
+            (
+                self.input_shape,
+                routed_input,
+                self.permuted_indices,
+                num_tokens_per_expert_group,
+            ) = _permute(
+                routed_input,
+                num_tokens_per_expert_group,
+                ep_degree,
+                num_local_experts,
+                local_expert_counts_i32,
+            )
+            fused_local_scores = None
+            fused_local_token_indices = None
+        else:
+            alignment = int(moe_utils.TOKEN_GROUP_ALIGN_SIZE_M)
+            padded_max_len = (
+                int(routed_input.shape[0])
+                + num_local_experts * alignment
+                + alignment
+                - 1
+            ) // alignment * alignment
+            with torch.no_grad():
+                (
+                    self.permuted_indices,
+                    num_tokens_per_expert_group,
+                    _,
+                ) = moe_utils.generate_permute_indices(
+                    num_tokens_per_expert_group,
+                    num_local_experts,
+                    ep_degree,
+                    padded_max_len,
+                    alignment,
+                    m_sizes=local_expert_counts_i32,
+                )
+            self.input_shape = (
+                int(routed_input.shape[0]) + 1,
+                int(routed_input.shape[1]),
+            )
+            routed_input = _LBTCollectiveWait.apply(routed_input)
+            (
+                routed_input,
+                fused_local_scores,
+                fused_local_token_indices,
+            ) = _LBTPermutedDispatchUnpack.apply(
+                routed_input,
+                self.permuted_indices,
+                int(fused_packed_input_cols),
+            )
         try:
             num_tokens_per_expert_group._lbt_counts_list = local_expert_counts_list
         except Exception:
             pass
 
+        if fused_packed_input_cols is not None:
+            return (
+                routed_input,
+                num_tokens_per_expert_group,
+                fused_local_scores,
+                fused_local_token_indices,
+            )
         return routed_input, num_tokens_per_expert_group
 
     @staticmethod
@@ -1405,12 +1646,16 @@ class ExpertParallel(ParallelStyle):
         token_indices: torch.Tensor | None,
         num_origin_tokens: int | None,
         device_mesh: DeviceMesh,
+        packed_routed_input_and_scores: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if not _lbt_ep_scored_output_combine():
             return None
-        if routed_input.dim() != 2 or top_scores.dim() != 1:
+        if top_scores.dim() != 1:
             return None
-        if int(routed_input.shape[0]) != int(top_scores.numel()):
+        if packed_routed_input_and_scores is None and (
+            routed_input.dim() != 2
+            or int(routed_input.shape[0]) != int(top_scores.numel())
+        ):
             return None
 
         local_token_indices = None
@@ -1424,35 +1669,80 @@ class ExpertParallel(ParallelStyle):
         )
         score_dispatch_mode = _lbt_ep_score_dispatch_mode()
         if score_dispatch_mode == "pack_bf16":
-            packed_cols = [routed_input, top_scores.reshape(-1, 1).to(routed_input.dtype)]
-            if pack_local_reduce_indices:
-                token_indices_i64 = token_indices.reshape(-1).to(torch.int64)
-                packed_cols.extend(
-                    (
-                        torch.remainder(token_indices_i64, 256)
-                        .reshape(-1, 1)
-                        .to(routed_input.dtype),
-                        torch.div(token_indices_i64, 256, rounding_mode="floor")
-                        .reshape(-1, 1)
-                        .to(routed_input.dtype),
+            packed_metadata_cols = 3 if pack_local_reduce_indices else 1
+            if packed_routed_input_and_scores is None:
+                packed_cols = [
+                    routed_input,
+                    top_scores.reshape(-1, 1).to(routed_input.dtype),
+                ]
+                if pack_local_reduce_indices:
+                    token_indices_i64 = token_indices.reshape(-1).to(torch.int64)
+                    packed_cols.extend(
+                        (
+                            torch.remainder(token_indices_i64, 256)
+                            .reshape(-1, 1)
+                            .to(routed_input.dtype),
+                            torch.div(token_indices_i64, 256, rounding_mode="floor")
+                            .reshape(-1, 1)
+                            .to(routed_input.dtype),
+                        )
                     )
-                )
-            routed_input_and_scores = torch.cat(packed_cols, dim=1)
-            local_input_and_scores, local_counts = self._token_dispatch(
-                mod,
-                (routed_input_and_scores, num_tokens_per_expert),
-                device_mesh,
-            )
-            if pack_local_reduce_indices:
-                local_scores = local_input_and_scores[:, -3:-2].to(torch.float32)
-                local_token_indices = (
-                    local_input_and_scores[:, -2].to(torch.int64)
-                    + local_input_and_scores[:, -1].to(torch.int64) * 256
-                )
-                local_input = local_input_and_scores[:, :-3].contiguous()
+                routed_input_and_scores = torch.cat(packed_cols, dim=1)
             else:
-                local_scores = local_input_and_scores[:, -1:].to(torch.float32)
-                local_input = local_input_and_scores[:, :-1].contiguous()
+                if (
+                    not pack_local_reduce_indices
+                    or packed_routed_input_and_scores.dim() != 2
+                    or int(packed_routed_input_and_scores.shape[0])
+                    != int(top_scores.numel())
+                    or int(packed_routed_input_and_scores.shape[1])
+                    != int(routed_input.shape[1]) + 4
+                ):
+                    return None
+                packed_metadata_cols = 4
+                routed_input_and_scores = packed_routed_input_and_scores
+            fused_unpack = (
+                packed_routed_input_and_scores is not None
+                and _lbt_ep_fused_indexed_dispatch_unpack()
+                and _lbt_get_moe_permuted_dispatch_unpack() is not None
+            )
+            if fused_unpack:
+                (
+                    local_input,
+                    local_counts,
+                    local_scores,
+                    local_token_indices,
+                ) = self._token_dispatch_impl(
+                    mod,
+                    (routed_input_and_scores, num_tokens_per_expert),
+                    device_mesh,
+                    fused_packed_input_cols=int(routed_input.shape[1]),
+                )
+                local_scores = local_scores.reshape(-1, 1)
+            else:
+                local_input_and_scores, local_counts = self._token_dispatch(
+                    mod,
+                    (routed_input_and_scores, num_tokens_per_expert),
+                    device_mesh,
+                )
+                if pack_local_reduce_indices:
+                    local_scores = local_input_and_scores[
+                        :, -packed_metadata_cols
+                    ].reshape(-1, 1).to(torch.float32)
+                    local_token_indices = (
+                        local_input_and_scores[
+                            :, -packed_metadata_cols + 1
+                        ].to(torch.int64)
+                        + local_input_and_scores[
+                            :, -packed_metadata_cols + 2
+                        ].to(torch.int64)
+                        * 256
+                    )
+                    local_input = local_input_and_scores[
+                        :, :-packed_metadata_cols
+                    ].contiguous()
+                else:
+                    local_scores = local_input_and_scores[:, -1:].to(torch.float32)
+                    local_input = local_input_and_scores[:, :-1].contiguous()
         else:
             local_input, local_counts = self._token_dispatch(
                 mod,
@@ -1513,6 +1803,56 @@ class ExpertParallel(ParallelStyle):
             self.input_shape = (self.input_shape[0], local_output.shape[1])
         return self._token_combine(mod, local_output, device_mesh)
 
+    def _forward_ep_indexed_scored_output_combine(
+        self,
+        mod: nn.Module,
+        source_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        top_scores: torch.Tensor,
+        token_indices: torch.Tensor,
+        num_origin_tokens: int,
+        device_mesh: DeviceMesh,
+    ) -> torch.Tensor | None:
+        if (
+            not _lbt_ep_fused_indexed_dispatch_pack()
+            or not _lbt_ep_scored_output_combine()
+            or not _lbt_ep_local_reduce_output_combine()
+            or not _lbt_ep_pack_local_reduce_indices()
+            or _lbt_ep_score_dispatch_mode() != "pack_bf16"
+            or source_input.dim() != 2
+            or source_input.dtype != torch.bfloat16
+            or not source_input.is_cuda
+            or not source_input.is_contiguous()
+            or int(source_input.shape[1]) % 4 != 0
+            or top_scores.dim() != 1
+            or top_scores.dtype != torch.float32
+            or not top_scores.is_cuda
+            or token_indices.dim() != 1
+            or token_indices.dtype != torch.int64
+            or not token_indices.is_cuda
+            or int(token_indices.numel()) != int(top_scores.numel())
+            or int(source_input.shape[0]) != int(num_origin_tokens)
+            or int(num_origin_tokens) > 256 * 256
+            or _lbt_get_moe_indexed_dispatch_pack() is None
+        ):
+            return None
+
+        packed = _LBTIndexedDispatchPack.apply(
+            source_input,
+            token_indices,
+            top_scores,
+        )
+        return self._forward_ep_scored_output_combine(
+            mod,
+            source_input,
+            num_tokens_per_expert,
+            top_scores,
+            token_indices,
+            num_origin_tokens,
+            device_mesh,
+            packed,
+        )
+
     def _attach_scored_output_combine(
         self,
         module: nn.Module,
@@ -1540,6 +1880,29 @@ class ExpertParallel(ParallelStyle):
 
         module.forward_ep_scored_output_combine = types.MethodType(
             forward_ep_scored_output_combine,
+            module,
+        )
+
+        def forward_ep_indexed_scored_output_combine(
+            mod: nn.Module,
+            source_input: torch.Tensor,
+            num_tokens_per_expert: torch.Tensor,
+            top_scores: torch.Tensor,
+            token_indices: torch.Tensor,
+            num_origin_tokens: int,
+        ) -> torch.Tensor | None:
+            return ep_style._forward_ep_indexed_scored_output_combine(
+                mod,
+                source_input,
+                num_tokens_per_expert,
+                top_scores,
+                token_indices,
+                num_origin_tokens,
+                device_mesh,
+            )
+
+        module.forward_ep_indexed_scored_output_combine = types.MethodType(
+            forward_ep_indexed_scored_output_combine,
             module,
         )
 
