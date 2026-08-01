@@ -1172,6 +1172,7 @@ class ExpertParallel(ParallelStyle):
         self._equal_split_a2a = False
         self.input_shape = None
         self.permuted_indices = None
+        self._lbt_dispatch_metadata_cache = None
 
     # performing all-to-all dispatch on the input
     def _token_dispatch(self, mod, inputs, device_mesh):
@@ -1218,6 +1219,31 @@ class ExpertParallel(ParallelStyle):
             and _lbt_ep_exact_equal_split_a2a()
         )
 
+        cache_enabled = _lbt_env_flag("LBT_EP_CACHE_DISPATCH_METADATA")
+        cache_key = (
+            ep_degree,
+            num_local_experts,
+            total_routed_rows,
+            num_tokens_per_expert.dtype,
+            num_tokens_per_expert.device,
+            equal_split_a2a,
+        )
+        graph_task_id = torch._C._current_graph_task_id()
+        cached_metadata = self._lbt_dispatch_metadata_cache
+        # Checkpoint replay regenerates the same GPU metadata. Reuse only its
+        # materialized Python lists to avoid a second pageable D2H copy.
+        if graph_task_id >= 0:
+            self._lbt_dispatch_metadata_cache = None
+        elif not cache_enabled:
+            self._lbt_dispatch_metadata_cache = None
+
+        cache_hit = (
+            cache_enabled
+            and graph_task_id >= 0
+            and cached_metadata is not None
+            and cached_metadata[0] == cache_key
+        )
+
         # generate the input splits and output splits for all-to-all
         with torch.no_grad():
             if not equal_split_a2a:
@@ -1258,7 +1284,12 @@ class ExpertParallel(ParallelStyle):
                 (local_expert_counts + alignment - 1) // alignment * alignment
             )
             local_expert_counts_i32 = local_expert_counts.to(torch.int32)
-            if equal_split_a2a:
+            if cache_hit:
+                _, input_splits, output_splits, local_counts = cached_metadata
+                self.input_splits = list(input_splits)
+                self.output_splits = list(output_splits)
+                local_expert_counts_list = list(local_counts)
+            elif equal_split_a2a:
                 self.input_splits = _lbt_equal_splits(total_routed_rows, ep_degree)
                 self.output_splits = list(self.input_splits)
                 # Only local expert counts need a host list in exact equal-split
@@ -1288,6 +1319,14 @@ class ExpertParallel(ParallelStyle):
                 self.output_splits = host_sizes[ep_degree : 2 * ep_degree].tolist()
                 local_expert_counts_list = host_sizes[2 * ep_degree :].tolist()
             self._equal_split_a2a = equal_split_a2a
+
+        if cache_enabled and graph_task_id < 0:
+            self._lbt_dispatch_metadata_cache = (
+                cache_key,
+                tuple(self.input_splits),
+                tuple(self.output_splits),
+                tuple(local_expert_counts_list),
+            )
 
         _lbt_debug_ep_splits(
             "dispatch",
