@@ -3026,6 +3026,7 @@ class MoE(nn.Module):
                     top_scores_experts_sorted.reshape(-1),
                     token_indices_experts_sorted,
                     int(x.shape[0]),
+                    route_positions_experts_sorted,
                 )
                 routed_output_is_scored = routed_output is not None
                 routed_output_is_precombined = (
