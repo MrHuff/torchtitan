@@ -46,14 +46,19 @@ _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16 = None
 _LBT_MOE_INDEXED_SCALE_DOT_ROWS_PERMUTED_EP2_BF16_IMPORT_ATTEMPTED = False
 _LBT_MOE_PACK_INDEXED_DISPATCH_BF16 = None
 _LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_BF16 = None
+_LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_ALIGNED_BF16 = None
 _LBT_MOE_UNPACK_INDEXED_DISPATCH_GRAD_BF16 = None
 _LBT_MOE_INDEXED_DISPATCH_PACK_IMPORT_ATTEMPTED = False
 _LBT_MOE_INDEXED_DISPATCH_SLOTS_PACK_IMPORT_ATTEMPTED = False
+_LBT_MOE_INDEXED_DISPATCH_SLOTS_ALIGNED_PACK_IMPORT_ATTEMPTED = False
 _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16 = None
 _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_BF16 = None
+_LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_METADATA_BF16 = None
 _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16 = None
+_LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_ALIGNED_BF16 = None
 _LBT_MOE_PERMUTED_DISPATCH_UNPACK_IMPORT_ATTEMPTED = False
 _LBT_MOE_PERMUTED_DISPATCH_SLOTS_UNPACK_IMPORT_ATTEMPTED = False
+_LBT_MOE_PERMUTED_DISPATCH_SLOTS_METADATA_IMPORT_ATTEMPTED = False
 
 
 def _lbt_env_flag(name: str, default: bool = False) -> bool:
@@ -226,6 +231,10 @@ def _lbt_ep_fused_indexed_dispatch_unpack() -> bool:
     if "LBT_EP_FUSED_INDEXED_DISPATCH_UNPACK" in os.environ:
         return _lbt_env_flag("LBT_EP_FUSED_INDEXED_DISPATCH_UNPACK")
     return _lbt_ep_fused_indexed_dispatch_pack()
+
+
+def _lbt_ep_fused_packed_expert_quant() -> bool:
+    return _lbt_env_flag("LBT_EP_FUSED_PACKED_EXPERT_QUANT")
 
 
 def _lbt_ep_local_reduce_index_dtype() -> str:
@@ -437,6 +446,26 @@ def _lbt_get_moe_indexed_dispatch_slots_pack():
     return _LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_BF16
 
 
+def _lbt_get_moe_indexed_dispatch_slots_aligned_pack():
+    global _LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_ALIGNED_BF16
+    global _LBT_MOE_INDEXED_DISPATCH_SLOTS_ALIGNED_PACK_IMPORT_ATTEMPTED
+    if not _LBT_MOE_INDEXED_DISPATCH_SLOTS_ALIGNED_PACK_IMPORT_ATTEMPTED:
+        _LBT_MOE_INDEXED_DISPATCH_SLOTS_ALIGNED_PACK_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_aligned_dispatch_slots_available,
+                mxfp4_moe_pack_indexed_dispatch_slots_aligned_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_ALIGNED_BF16 = None
+        else:
+            if mxfp4_moe_aligned_dispatch_slots_available():
+                _LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_ALIGNED_BF16 = (
+                    mxfp4_moe_pack_indexed_dispatch_slots_aligned_bf16
+                )
+    return _LBT_MOE_PACK_INDEXED_DISPATCH_SLOTS_ALIGNED_BF16
+
+
 def _lbt_get_moe_permuted_dispatch_unpack():
     global _LBT_MOE_UNPACK_PERMUTED_DISPATCH_BF16
     global _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_BF16
@@ -491,6 +520,40 @@ def _lbt_get_moe_permuted_dispatch_slots_unpack():
     return _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_BF16
 
 
+def _lbt_get_moe_permuted_dispatch_slots_metadata_unpack():
+    global _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_METADATA_BF16
+    global _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_ALIGNED_BF16
+    global _LBT_MOE_PERMUTED_DISPATCH_SLOTS_METADATA_IMPORT_ATTEMPTED
+    if not _LBT_MOE_PERMUTED_DISPATCH_SLOTS_METADATA_IMPORT_ATTEMPTED:
+        _LBT_MOE_PERMUTED_DISPATCH_SLOTS_METADATA_IMPORT_ATTEMPTED = True
+        try:
+            from low_bits_training.quantization.mxfp4_backend import (
+                mxfp4_moe_aligned_dispatch_slots_available,
+                mxfp4_moe_pack_permuted_dispatch_grad_aligned_bf16,
+                mxfp4_moe_unpack_permuted_dispatch_slots_metadata_bf16,
+            )
+        except (AttributeError, FileNotFoundError, ImportError):
+            _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_METADATA_BF16 = None
+            _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_ALIGNED_BF16 = None
+        else:
+            if mxfp4_moe_aligned_dispatch_slots_available():
+                _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_METADATA_BF16 = (
+                    mxfp4_moe_unpack_permuted_dispatch_slots_metadata_bf16
+                )
+                _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_ALIGNED_BF16 = (
+                    mxfp4_moe_pack_permuted_dispatch_grad_aligned_bf16
+                )
+    if (
+        _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_METADATA_BF16 is None
+        or _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_ALIGNED_BF16 is None
+    ):
+        return None
+    return (
+        _LBT_MOE_UNPACK_PERMUTED_DISPATCH_SLOTS_METADATA_BF16,
+        _LBT_MOE_PACK_PERMUTED_DISPATCH_GRAD_ALIGNED_BF16,
+    )
+
+
 class _LBTIndexedDispatchPack(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -536,8 +599,13 @@ class _LBTIndexedDispatchSlotsPack(torch.autograd.Function):
         scores: torch.Tensor,
         route_positions: torch.Tensor,
         top_k: int,
+        aligned: bool,
     ) -> torch.Tensor:
-        pack_fn = _lbt_get_moe_indexed_dispatch_slots_pack()
+        pack_fn = (
+            _lbt_get_moe_indexed_dispatch_slots_aligned_pack()
+            if aligned
+            else _lbt_get_moe_indexed_dispatch_slots_pack()
+        )
         if pack_fn is None:
             raise RuntimeError("MXFP4 indexed dispatch slot pack helper is unavailable")
         token_indices = token_indices.to(torch.int64).contiguous()
@@ -568,7 +636,7 @@ class _LBTIndexedDispatchSlotsPack(torch.autograd.Function):
             ctx.input_rows,
             ctx.input_cols,
         )
-        return grad_input, None, grad_scores, None, None
+        return grad_input, None, grad_scores, None, None, None
 
 
 class _LBTPermutedDispatchUnpack(torch.autograd.Function):
@@ -675,6 +743,72 @@ class _LBTPermutedDispatchSlotsUnpack(torch.autograd.Function):
         unpack_ops = _lbt_get_moe_permuted_dispatch_unpack()
         if unpack_ops is None:
             raise RuntimeError("MXFP4 permuted dispatch gradient helper is unavailable")
+        _, pack_grad_fn = unpack_ops
+        grad_packed = pack_grad_fn(
+            grad_local_input.contiguous(),
+            grad_local_scores.reshape(-1).to(torch.float32).contiguous(),
+            permuted_indices,
+            ctx.input_rows,
+        )
+        return grad_packed, None, None
+
+
+class _LBTPermutedDispatchSlotsMetadataUnpack(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        packed: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        input_cols: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        unpack_ops = _lbt_get_moe_permuted_dispatch_slots_metadata_unpack()
+        if unpack_ops is None:
+            raise RuntimeError(
+                "MXFP4 permuted dispatch metadata helpers are unavailable"
+            )
+        unpack_fn, _ = unpack_ops
+        permuted_indices = permuted_indices.to(torch.int32).contiguous()
+        local_scores, local_token_indices, local_route_slots = unpack_fn(
+            packed.contiguous(),
+            permuted_indices,
+            int(input_cols),
+        )
+        local_input = packed.new_empty(1).as_strided(
+            (int(permuted_indices.numel()), int(input_cols)),
+            (0, 0),
+        )
+        ctx.save_for_backward(permuted_indices)
+        ctx.input_rows = int(packed.shape[0])
+        ctx.input_cols = int(input_cols)
+        ctx.mark_non_differentiable(local_token_indices, local_route_slots)
+        return local_input, local_scores, local_token_indices, local_route_slots
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_local_input: torch.Tensor | None,
+        grad_local_scores: torch.Tensor | None,
+        _grad_local_token_indices: torch.Tensor | None,
+        _grad_local_route_slots: torch.Tensor | None,
+    ):
+        (permuted_indices,) = ctx.saved_tensors
+        if grad_local_input is None:
+            grad_local_input = torch.zeros(
+                (int(permuted_indices.numel()), ctx.input_cols),
+                device=permuted_indices.device,
+                dtype=torch.bfloat16,
+            )
+        if grad_local_scores is None:
+            grad_local_scores = torch.zeros(
+                int(permuted_indices.numel()),
+                device=permuted_indices.device,
+                dtype=torch.float32,
+            )
+        unpack_ops = _lbt_get_moe_permuted_dispatch_slots_metadata_unpack()
+        if unpack_ops is None:
+            raise RuntimeError(
+                "MXFP4 permuted dispatch metadata gradient helper is unavailable"
+            )
         _, pack_grad_fn = unpack_ops
         grad_packed = pack_grad_fn(
             grad_local_input.contiguous(),
@@ -1430,6 +1564,7 @@ class ExpertParallel(ParallelStyle):
         device_mesh,
         fused_packed_input_cols: int | None = None,
         fused_packed_route_slots: bool = False,
+        fused_packed_expert_quant: bool = False,
     ):
         # annotate module input placements/sharding with input_layouts
         routed_input, num_tokens_per_expert = inputs
@@ -1644,13 +1779,18 @@ class ExpertParallel(ParallelStyle):
                 int(routed_input.shape[1]),
             )
             routed_input = _LBTCollectiveWait.apply(routed_input)
+            packed_local_input = routed_input if fused_packed_expert_quant else None
             if fused_packed_route_slots:
                 (
                     routed_input,
                     fused_local_scores,
                     fused_local_token_indices,
                     fused_local_route_slots,
-                ) = _LBTPermutedDispatchSlotsUnpack.apply(
+                ) = (
+                    _LBTPermutedDispatchSlotsMetadataUnpack.apply
+                    if fused_packed_expert_quant
+                    else _LBTPermutedDispatchSlotsUnpack.apply
+                )(
                     routed_input,
                     self.permuted_indices,
                     int(fused_packed_input_cols),
@@ -1678,6 +1818,7 @@ class ExpertParallel(ParallelStyle):
                 fused_local_scores,
                 fused_local_token_indices,
                 fused_local_route_slots,
+                packed_local_input,
             )
         return routed_input, num_tokens_per_expert_group
 
@@ -2008,6 +2149,7 @@ class ExpertParallel(ParallelStyle):
         packed_routed_input_and_scores: torch.Tensor | None = None,
         packed_route_slots: bool = False,
         top_k: int = 0,
+        packed_expert_quant: bool = False,
     ) -> torch.Tensor | None:
         if not _lbt_ep_scored_output_combine():
             return None
@@ -2021,6 +2163,7 @@ class ExpertParallel(ParallelStyle):
 
         local_token_indices = None
         local_route_slots = None
+        packed_local_input = None
         pack_local_reduce_indices = (
             _lbt_ep_local_reduce_output_combine()
             and _lbt_ep_pack_local_reduce_indices()
@@ -2057,7 +2200,8 @@ class ExpertParallel(ParallelStyle):
                     or int(packed_routed_input_and_scores.shape[0])
                     != int(top_scores.numel())
                     or int(packed_routed_input_and_scores.shape[1])
-                    != int(routed_input.shape[1]) + 4
+                    != int(routed_input.shape[1])
+                    + (8 if packed_expert_quant else 4)
                 ):
                     return None
                 packed_metadata_cols = 4
@@ -2066,11 +2210,18 @@ class ExpertParallel(ParallelStyle):
                 packed_routed_input_and_scores is not None
                 and _lbt_ep_fused_indexed_dispatch_unpack()
                 and (
-                    _lbt_get_moe_permuted_dispatch_slots_unpack() is not None
-                    if packed_route_slots
-                    else _lbt_get_moe_permuted_dispatch_unpack() is not None
+                    _lbt_get_moe_permuted_dispatch_slots_metadata_unpack()
+                    is not None
+                    if packed_expert_quant
+                    else (
+                        _lbt_get_moe_permuted_dispatch_slots_unpack() is not None
+                        if packed_route_slots
+                        else _lbt_get_moe_permuted_dispatch_unpack() is not None
+                    )
                 )
             )
+            if packed_expert_quant and not fused_unpack:
+                return None
             if fused_unpack:
                 (
                     local_input,
@@ -2078,12 +2229,14 @@ class ExpertParallel(ParallelStyle):
                     local_scores,
                     local_token_indices,
                     local_route_slots,
+                    packed_local_input,
                 ) = self._token_dispatch_impl(
                     mod,
                     (routed_input_and_scores, num_tokens_per_expert),
                     device_mesh,
                     fused_packed_input_cols=int(routed_input.shape[1]),
                     fused_packed_route_slots=packed_route_slots,
+                    fused_packed_expert_quant=packed_expert_quant,
                 )
                 local_scores = local_scores.reshape(-1, 1)
             else:
@@ -2127,7 +2280,19 @@ class ExpertParallel(ParallelStyle):
                 device_mesh,
             ).to(torch.float32)
 
-        local_output = mod.forward(local_input, local_counts)
+        if packed_local_input is not None:
+            forward_packed_ep = getattr(mod, "forward_packed_ep", None)
+            if not callable(forward_packed_ep):
+                raise RuntimeError("Packed EP expert forward became unavailable")
+            local_output = forward_packed_ep(
+                local_input,
+                local_counts,
+                packed_local_input,
+                self.permuted_indices,
+                int(routed_input.shape[1]),
+            )
+        else:
+            local_output = mod.forward(local_input, local_counts)
         fuse_score_reduce = (
             _lbt_ep_local_reduce_fused_score_scatter()
             or _lbt_ep_local_reduce_fused_score_bwd()
@@ -2221,6 +2386,18 @@ class ExpertParallel(ParallelStyle):
             and _lbt_get_moe_permuted_dispatch_slots_unpack() is not None
             and _lbt_get_moe_route_slot_sum_permuted_ep2_bf16() is not None
         )
+        packed_expert_quant = False
+        packed_ep_available = getattr(mod, "packed_ep_dispatch_available", None)
+        if (
+            use_route_slots
+            and _lbt_ep_fused_packed_expert_quant()
+            and _lbt_ep_fused_indexed_dispatch_unpack()
+            and callable(getattr(mod, "forward_packed_ep", None))
+            and callable(packed_ep_available)
+            and _lbt_get_moe_indexed_dispatch_slots_aligned_pack() is not None
+            and _lbt_get_moe_permuted_dispatch_slots_metadata_unpack() is not None
+        ):
+            packed_expert_quant = bool(packed_ep_available())
         if use_route_slots:
             packed = _LBTIndexedDispatchSlotsPack.apply(
                 source_input,
@@ -2228,6 +2405,7 @@ class ExpertParallel(ParallelStyle):
                 top_scores,
                 route_positions,
                 top_k,
+                packed_expert_quant,
             )
         else:
             packed = _LBTIndexedDispatchPack.apply(
@@ -2246,6 +2424,7 @@ class ExpertParallel(ParallelStyle):
             packed,
             use_route_slots,
             top_k,
+            packed_expert_quant,
         )
 
     def _attach_scored_output_combine(
